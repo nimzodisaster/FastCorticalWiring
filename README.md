@@ -85,4 +85,4 @@ The script is run from the command line and requires a path to a FreeSurfer subj
 
 To process both hemispheres of `subject01` using the pial surface and save the results to the subject's default `surf/` directory:
 ```bash
-python main.py /path/to/subjects_dir subject01
+python fastcw.py python --surf-type pial   /mnt/gold/local_FreeSurfer_Subject_directory mysubjectid
