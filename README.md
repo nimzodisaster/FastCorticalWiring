@@ -124,10 +124,10 @@ python cortical_wiring_analysis.py <subject_dir> <subject_id> [OPTIONS]
 ### Computation Options
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--compute-msd` / `--no-compute-msd` | `True` | Enable/disable MSD (Mean Squared Distance) computation |
-| `--scale` | `0.05` | Scale for local measures (proportion of cortex area, e.g., 0.05 = 5%) |
-| `--area-tol` | `0.01` | Relative tolerance for area binary search (e.g., 0.01 = 1%) |
-| `--eps` | `1e-6` | Numerical tolerance for isoline tests |
+| `--compute-msd` / `--no-compute-msd` | `True` | Enable/disable MSD (Mean Separation Distance) computation. MSD is the area-weighted average geodesic distance from each vertex to all other cortical vertices, quantifying global connectivity cost. |
+| `--scale` | `0.05` | Scale for local measures (proportion of cortex area). Determines target area for radius/perimeter functions - e.g., 0.05 = 5% of total cortical area. This 5% value was used in the original Ecker et al. 2013 paper. |
+| `--area-tol` | `0.01` | Relative tolerance for area binary search convergence (1% = 0.01). Controls precision when finding the radius that encompasses exactly the target area. Default is usually sufficient. |
+| `--eps` | `1e-6` | Numerical tolerance for geometric computations, particularly for determining when vertices lie exactly on geodesic isolines. Default handles typical mesh precision well. |
 
 ## Examples
 
