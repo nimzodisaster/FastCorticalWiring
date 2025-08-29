@@ -158,4 +158,4 @@ python cortical_wiring_analysis.py /path/to/subjects subject01 \
 ```
 
 
-![fast!](path/to/your/log2o.png)
+![fast!](./log2o.png)
