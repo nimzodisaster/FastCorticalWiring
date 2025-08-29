@@ -156,3 +156,6 @@ python cortical_wiring_analysis.py /path/to/subjects subject01 \
     --no-compute-msd \
     --area-tol 0.05
 ```
+
+
+![fast!](path/to/your/log2o.png)
