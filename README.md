@@ -86,3 +86,76 @@ The script is run from the command line and requires a path to a FreeSurfer subj
 To process both hemispheres of `subject01` using the pial surface and save the results to the subject's default `surf/` directory:
 ```bash
 python fastcw.py python --surf-type pial   /mnt/gold/local_FreeSurfer_Subject_directory mysubjectid
+
+### Advanced Information
+# Cortical Wiring Analysis
+
+Fast computation of intrinsic cortical wiring costs using pycortex (jit-optimized)
+
+## Usage
+
+```bash
+python cortical_wiring_analysis.py <subject_dir> <subject_id> [OPTIONS]
+```
+
+## Required Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `subject_dir` | FreeSurfer subjects directory |
+| `subject_id` | Subject ID |
+
+## Optional Arguments
+
+### Output Options
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir` | `{subject_dir}/{subject_id}/surf/` | Output directory for results |
+| `--overwrite` | `False` | Overwrite existing output files (default: exit if files exist) |
+| `--visualize` | `False` | Generate visualization PNG files |
+
+### Surface Processing
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hemispheres` | `lh rh` | Hemispheres to process (space-separated) |
+| `--surf-type` | `pial` | Surface type: `pial`, `white`, `inflated`, or custom surface name (e.g., `pialsurface6`) |
+| `--custom-label` | `None` | Custom cortex label name for non-standard surfaces (e.g., `cortex6` for `{hemi}.cortex6.label`) |
+
+### Computation Options
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--compute-msd` / `--no-compute-msd` | `True` | Enable/disable MSD (Mean Squared Distance) computation |
+| `--scale` | `0.05` | Scale for local measures (proportion of cortex area, e.g., 0.05 = 5%) |
+| `--area-tol` | `0.01` | Relative tolerance for area binary search (e.g., 0.01 = 1%) |
+| `--eps` | `1e-6` | Numerical tolerance for isoline tests |
+
+## Examples
+
+### Basic usage with default settings:
+```bash
+python cortical_wiring_analysis.py /path/to/freesurfer/subjects fsaverage
+```
+
+### Process only left hemisphere with custom output:
+```bash
+python cortical_wiring_analysis.py /path/to/subjects subject01 \
+    --hemispheres lh \
+    --output-dir /path/to/results \
+    --visualize
+```
+
+### Use custom surface with specific parameters:
+```bash
+python cortical_wiring_analysis.py /path/to/subjects subject01 \
+    --surf-type pialsurface6 \
+    --custom-label cortex6 \
+    --scale 0.1 \
+    --overwrite
+```
+
+### Disable MSD computation for faster processing:
+```bash
+python cortical_wiring_analysis.py /path/to/subjects subject01 \
+    --no-compute-msd \
+    --area-tol 0.05
+```
