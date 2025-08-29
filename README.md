@@ -4,12 +4,12 @@ A fast, Python-based implementation of the intrinsic cortical wiring cost metric
 
 ## Overview
 
-[cite_start]This repository provides a tool to replicate and extend the neuroimaging analysis from the paper **"Intrinsic gray-matter connectivity of the brain in adults with autism spectrum disorder"** by Ecker et al.[cite: 5]. [cite_start]The original study introduced a method to quantify the "wiring cost" of the brain's cortex by measuring geodesic distances on the cortical surface[cite: 14, 73].
+This repository provides a tool to replicate and extend the neuroimaging analysis from the paper **"Intrinsic gray-matter connectivity of the brain in adults with autism spectrum disorder"** by Ecker et al.. The original study introduced a method to quantify the "wiring cost" of the brain's cortex by measuring geodesic distances on the cortical surface.
 
 This implementation calculates the three key metrics from the paper:
-1.  [cite_start]**Mean Separation Distance (MSD):** The global "wiring cost" of a cortical location[cite: 75].
-2.  [cite_start]**Radius Function:** A measure of local intra-areal wiring cost[cite: 77].
-3.  [cite_start]**Perimeter Function:** A measure of local inter-areal wiring cost[cite: 77].
+1.  **Mean Separation Distance (MSD):** The global "wiring cost" of a cortical location.
+2.  **Radius Function:** A measure of local intra-areal wiring cost.
+3.  **Perimeter Function:** A measure of local inter-areal wiring cost.
 
 The primary advantage of this implementation is its performance. It leverages the "heat method" for geodesic distance computation via the `pycortex` library, which is significantly faster than traditional approaches like Dijkstra's algorithm. It also uses `numba` for optional just-in-time (JIT) compilation of performance-critical geometric calculations, providing a substantial speedup.
 
@@ -22,16 +22,25 @@ The primary advantage of this implementation is its performance. It leverages th
 * **Easy to Use:** Provides a simple command-line interface to process subjects from a FreeSurfer `subjects_dir`.
 * **Standard Outputs:** Generates results in both user-friendly CSV and FreeSurfer-compatible `.mgh` formats for easy visualization and statistical analysis.
 
+### Performance: The Heat Method Advantage
+
+This implementation's speed comes from using the **heat method** for geodesic distance computation (Crane et al., 2013), provided by the `pycortex` library (Gao et al., 2015).
+
+Instead of traversing the mesh edge-by-edge like classic algorithms (e.g., Dijkstra's), the heat method simulates the diffusion of heat from a source vertex. This provides a robust and efficient way to model the "wavefronts" from which geodesic distances can be derived.  The algorithm works in three main steps:
+
+1.  **Solve the Heat Flow**: A burst of heat is placed at the source vertex, and the algorithm calculates how it spreads across the mesh for a short time, establishing a smooth temperature gradient.
+2.  **Evaluate the Gradient Field**: The algorithm determines the direction of fastest heat dissipation across the surface. This gradient field effectively creates a map of vectors pointing back toward the source along the shortest paths.
+3.  **Solve the Poisson Equation**: Finally, this gradient field is integrated to recover the actual geodesic distance values for all points on the mesh simultaneously.
+
+This "whole-surface" approach is significantly faster than traditional methods for the "one-to-all" distance calculations required by this analysis. While Dijkstra's algorithm is efficient for finding a single shortest path, it becomes slow when repeated for every target vertex. The heat method solves for the entire distance field at once using efficient linear algebra, making it ideal for calculating the MSD and the numerous local metrics across the cortex.
+
 ## Scientific Background
 
-The brain's cortex is a highly folded sheet. [cite_start]The "wiring cost" between two points can be estimated by the shortest path between them *along this folded surface*, known as the geodesic distance[cite: 14, 73]. This script calculates metrics based on these distances to characterize the intrinsic connectivity of the cortex.
+The brain's cortex is a highly folded sheet. The "wiring cost" between two points can be estimated by the shortest path between them *along this folded surface*, known as the geodesic distance. This script calculates metrics based on these distances to characterize the intrinsic connectivity of the cortex, as proposed by Ecker et al. (2013).
 
-* [cite_start]**Mean Separation Distance (MSD):** For each point (vertex) on the cortical surface, the MSD is its average geodesic distance to all other points on the surface[cite: 75]. It represents the global wiring cost or "isolation" of that point.
-* [cite_start]**Radius Function (Intra-areal cost):** The geodesic radius required to draw a circle on the cortical surface that encloses a fixed percentage (e.g., 5%) of the total cortical area[cite: 76, 283]. [cite_start]Smaller radii imply lower costs for local, within-area connections[cite: 227].
-* [cite_start]**Perimeter Function (Inter-areal cost):** The perimeter of the geodesic circle defined by the radius function[cite: 77]. [cite_start]This is related to the cost of making connections to adjacent areas just outside the local patch[cite: 284].
-
-**Reference Paper:**
-> Ecker, C., Ronan, L., Feng, Y., Daly, E., Murphy, C., Ginestet, C. E., ... & Murphy, D. G. (2013). Intrinsic gray-matter connectivity of the brain in adults with autism spectrum disorder. [cite_start]*Proceedings of the National Academy of Sciences*, *110*(32), 13222-13227[cite: 5].
+* **Mean Separation Distance (MSD):** For each point (vertex) on the cortical surface, the MSD is its average geodesic distance to all other points on the surface. It represents the global wiring cost or "isolation" of that point.
+* **Radius Function (Intra-areal cost):** The geodesic radius required to draw a circle on the cortical surface that encloses a fixed percentage (e.g., 5%) of the total cortical area. Smaller radii imply lower costs for local, within-area connections.
+* **Perimeter Function (Inter-areal cost):** The perimeter of the geodesic circle defined by the radius function. This is related to the cost of making connections to adjacent areas just outside the local patch.
 
 ## Requirements
 
