@@ -975,7 +975,7 @@ class FastCorticalWiringAnalysis:
 
             # 2. Compute MSD from the distance vector (if requested)
             if compute_msd:
-            valid = (d_sub > self.eps) & np.isfinite(d_sub)
+                valid = (d_sub > self.eps) & np.isfinite(d_sub)
             if np.any(valid):
                 w = self.vertex_areas_sub[valid]      # submesh areas align with d_sub
                 msd_val = float((d_sub[valid] * w).sum() / w.sum())
