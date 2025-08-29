@@ -17,10 +17,10 @@ The primary advantage of this implementation is its performance. It leverages th
 
 * **Fast & Efficient:** Uses `pycortex`'s heat method for rapid geodesic distance calculation.
 * **Optimized:** Critical geometric loops for area and perimeter calculation are JIT-compiled with `numba` for a 10-100x speedup.
-* **Memory-Aware:** Operates on a cortex-only submesh, excluding the medial wall to drastically reduce computation time and memory usage.
+* **Allows Cortical Masking:** Operates on a cortex-only submesh, allowing users to exclude the medial wall, for example.
 * **Robust:** Implements robust geometric calculations to handle edge cases, such as vertices located exactly on an isoline.
-* **Easy to Use:** Provides a simple command-line interface to process subjects from a FreeSurfer `subjects_dir`.
-* **Standard Outputs:** Generates results in both user-friendly CSV and FreeSurfer-compatible `.mgh` formats for easy visualization and statistical analysis.
+* **Turnkey Usage:** Provides a simple command-line interface to process subjects from a FreeSurfer `subjects_dir`.
+* **Standard Outputs:** Generates results in both user-friendly CSV and FreeSurfer-compatible `.mgh` formats for easy visualization and statistical analysis. By Default, outputs appear in FreeSurfer subject surf folders.
 
 ### Performance: The Heat Method Advantage
 
