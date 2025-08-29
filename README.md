@@ -1,6 +1,6 @@
 # Fast Cortical Wiring (beta)
 
-A fast, Python-based implementation of the intrinsic cortical wiring cost metrics described in Ecker et al. (2013), optimized with Pycortex and Numba.
+A fast, Python-based implementation of the intrinsic cortical wiring cost metrics described in Ecker et al. (2013), optimized with Pycortex Functions for Heat-Based Geodesics and Numba.
 
 ## Overview
 
