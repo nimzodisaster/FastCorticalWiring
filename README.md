@@ -81,13 +81,9 @@ The script is built for Python 3. The primary dependencies are:
 
 The script is run from the command line and requires a path to a FreeSurfer subjects directory and a subject ID.
 
-### Basic Example
-
-To process both hemispheres of `subject01` using the pial surface and save the results to the subject's default `surf/` directory:
-```bash
-python fastcw.py python --surf-type pial   /mnt/gold/local_FreeSurfer_Subject_directory mysubjectid
-
 ### Advanced Information
+
+
 # Cortical Wiring Analysis
 
 Fast computation of intrinsic cortical wiring costs using pycortex (jit-optimized)
