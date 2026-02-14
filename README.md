@@ -1,5 +1,5 @@
 # Fast Cortical Wiring (beta)
-A fast, Python-based implementation of the intrinsic cortical wiring cost metrics described in Ecker et al. (2013), optimized with Pycortex Functions for Heat-Based Geodesics.
+A fast, Python-based implementation of the intrinsic cortical wiring cost metrics described in Ecker et al. (2013), optimized with Potpourri3d and/or Pycortex Functions for Heat-Based Geodesics.
 
 
 
@@ -12,7 +12,7 @@ This implementation calculates the three key metrics from the paper:
 2.  **Radius Function:** A measure of local intra-areal wiring cost.
 3.  **Perimeter Function:** A measure of local inter-areal wiring cost.
 
-The primary advantage of this implementation is its performance. It leverages the "heat method" for geodesic distance computation via the `pycortex` library, which is significantly faster than traditional approaches like Dijkstra's algorithm. It also uses `numba` for optional just-in-time (JIT) compilation of performance-critical geometric calculations, providing a substantial speedup.
+The primary advantage of this implementation is its performance. It leverages the "heat method" for geodesic distance computation via the `pycortex` library or 'Potpourri3d', the latter recently added, both of which is significantly faster than traditional approaches like Dijkstra's algorithm. It also uses `numba` for optional just-in-time (JIT) compilation of performance-critical geometric calculations, providing a substantial speedup.
 
 ## Key Features
 
@@ -21,6 +21,8 @@ The primary advantage of this implementation is its performance. It leverages th
 * **Allows Cortical Masking:** Operates on a cortex-only submesh, allowing users to exclude the medial wall, for example.
 * **Robust:** Implements robust geometric calculations to handle edge cases, such as vertices located exactly on an isoline.
 * **Turnkey Usage:** Provides a simple command-line interface to process subjects from a FreeSurfer `subjects_dir`.
+* ** Precomputed face geometry/length scales for clipping tolerances
+* ** BFS vertex ordering + warm-started radius bracketing
 * **Standard Outputs:** Generates results in both user-friendly CSV and FreeSurfer-compatible `.mgh` formats for easy visualization and statistical analysis. By Default, outputs appear in FreeSurfer subject surf folders.
 
 ### Performance: The Heat Method Advantage
