@@ -29,6 +29,7 @@ import nibabel as nib  # For reading FreeSurfer brain surface files
 import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
+from collections import deque
 from tqdm import tqdm  # Progress bars
 import warnings
 warnings.filterwarnings('ignore')
@@ -199,7 +200,7 @@ if NUMBA_AVAILABLE:
         CASES HANDLED:
         - nin=3: Entire triangle inside → add full face area
         - nin=1: One vertex inside → triangle formed by inside vertex + 2 intersections
-        - nin=2: Two vertices inside → quadrilateral → split into 2 triangles
+        - nin=2: Two vertices inside → full triangle minus outside-corner triangle
         - nin=0: No vertices inside → no contribution
         
         ROBUSTNESS FEATURES:
@@ -300,24 +301,44 @@ if NUMBA_AVAILABLE:
                 area_sum += _triangle_area_with_unit_normal(a, P1, P2, n)
                 
             elif nin == 2:
-                # Two vertices inside: form quadrilateral, split into triangles
-                if b0 and b1:
-                    a = v0; bv = v1
-                elif b1 and b2:
-                    a = v1; bv = v2
+                # Two vertices inside: compute inside area as full area minus the
+                # "outside corner" triangle at the single outside vertex.
+                if not b0:
+                    vo = v0; vi1 = v1; vi2 = v2
+                    do = d0; di1 = d1; di2 = d2
+                elif not b1:
+                    vo = v1; vi1 = v2; vi2 = v0
+                    do = d1; di1 = d2; di2 = d0
                 else:
-                    a = v2; bv = v0
-                    
-                if m >= 2:
-                    # Quadrilateral case: split along diagonal a-P2
-                    i,j,_ = _farthest_pair(P, m)
+                    vo = v2; vi1 = v0; vi2 = v1
+                    do = d2; di1 = d0; di2 = d1
+
+                p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, di1, r, abs_tol)
+                p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, di2, r, abs_tol)
+
+                if ok1 and ok2:
+                    P1 = np.empty(3, dtype=np.float64)
+                    P2 = np.empty(3, dtype=np.float64)
+                    P1[0], P1[1], P1[2] = p1x, p1y, p1z
+                    P2[0], P2[1], P2[2] = p2x, p2y, p2z
+                    outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
+                    inside_area = face_areas[f_idx] - outside_area
+                    if inside_area < 0.0:
+                        inside_area = 0.0
+                    if inside_area > face_areas[f_idx]:
+                        inside_area = face_areas[f_idx]
+                    area_sum += inside_area
+                elif m >= 2:
+                    # Fallback for rare degeneracies.
+                    i, j, _ = _farthest_pair(P, m)
                     P1 = P[i]; P2 = P[j]
-                    area_sum += _triangle_area_with_unit_normal(a, bv, P2, n)
-                    area_sum += _triangle_area_with_unit_normal(a, P2, P1, n)
-                elif m == 1:
-                    # Degenerate case: triangle with two inside vertices + 1 intersection
-                    P1 = P[0]
-                    area_sum += _triangle_area_with_unit_normal(a, bv, P1, n)
+                    outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
+                    inside_area = face_areas[f_idx] - outside_area
+                    if inside_area < 0.0:
+                        inside_area = 0.0
+                    if inside_area > face_areas[f_idx]:
+                        inside_area = face_areas[f_idx]
+                    area_sum += inside_area
                     
         return area_sum
 
@@ -556,13 +577,34 @@ class FastCorticalWiringAnalysis:
         print("Warning: Cortex label not found. Using aparc annotation...")
         annot_path = os.path.join(self.subject_dir, self.subject_id, 'label', f'{self.hemi}.aparc.annot')
         if os.path.exists(annot_path):
-            labels, ctab, names = nib.freesurfer.read_annot(annot_path)
-            # Exclude known non-cortical regions
-            exclude_names = {b'unknown', b'Unknown', b'corpuscallosum', b'Medial_wall'}
-            exclude_indices = {i for i, name in enumerate(names) if any(excl in name for excl in exclude_names)}
+            labels, ctab, names = nib.freesurfer.read_annot(annot_path, orig_ids=True)
+
+            def _normalize_region_name(name):
+                if isinstance(name, bytes):
+                    name = name.decode('utf-8', errors='ignore')
+                return ''.join(ch.lower() for ch in str(name) if ch.isalnum())
+
+            # Build name -> annotation code mapping from color table (RGBT + code).
+            if ctab.ndim == 2 and ctab.shape[1] >= 5 and ctab.shape[0] == len(names):
+                codes = ctab[:, 4]
+            else:
+                # Fallback if color-table codes are unavailable/unexpected.
+                codes = np.arange(len(names), dtype=np.int32)
+
+            name_to_code = {}
+            for i, raw_name in enumerate(names):
+                norm_name = _normalize_region_name(raw_name)
+                name_to_code[norm_name] = int(codes[i])
+
+            exclude_tokens = ('unknown', 'corpuscallosum', 'medialwall')
+            exclude_codes = {
+                code for norm_name, code in name_to_code.items()
+                if any(token in norm_name for token in exclude_tokens)
+            }
+
             cortex_mask = np.ones(self.vertices_full.shape[0], dtype=bool)
-            for idx in exclude_indices:
-                cortex_mask[labels == idx] = False
+            for code in exclude_codes:
+                cortex_mask[labels == code] = False
             cortex_mask[labels == -1] = False  # Exclude unlabeled vertices
             print(f"Created cortex mask from aparc: {int(np.sum(cortex_mask))} cortical vertices")
             return cortex_mask
@@ -823,19 +865,48 @@ class FastCorticalWiringAnalysis:
                 b, c = P[0], P[1]
                 area += 0.5 * abs(np.dot(normals[f_idx], np.cross(b - a, c - a)))
             else:  # n_in == 2
+                idx_out = int(np.where(~inside)[0][0])
                 idx_in = np.where(inside)[0]
-                a = v_face[idx_in[0]]
-                b = v_face[idx_in[1]]
-                P = self._edge_intersections(r, d, v_face)
-                if len(P) == 0:
-                    continue
-                if len(P) == 1:
-                    area += 0.5 * abs(np.dot(normals[f_idx], np.cross(b - a, P[0] - a)))
+                vo = v_face[idx_out]
+                vi1 = v_face[idx_in[0]]
+                vi2 = v_face[idx_in[1]]
+                do = d[idx_out]
+                di1 = d[idx_in[0]]
+                di2 = d[idx_in[1]]
+
+                p1, p2 = None, None
+                if abs(do - r) <= eps:
+                    p1 = vo
+                elif abs(di1 - r) <= eps:
+                    p1 = vi1
                 else:
-                    # Split quadrilateral into two triangles
+                    den = (di1 - do)
+                    if abs(den) > 1e-20:
+                        t = (r - do) / den
+                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                        p1 = vo + t * (vi1 - vo)
+
+                if abs(do - r) <= eps:
+                    p2 = vo
+                elif abs(di2 - r) <= eps:
+                    p2 = vi2
+                else:
+                    den = (di2 - do)
+                    if abs(den) > 1e-20:
+                        t = (r - do) / den
+                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                        p2 = vo + t * (vi2 - vo)
+
+                if p1 is None or p2 is None:
+                    P = self._edge_intersections(r, d, v_face)
+                    if len(P) < 2:
+                        continue
                     p1, p2 = P[0], P[1]
-                    area += 0.5 * abs(np.dot(normals[f_idx], np.cross(b - a, p2 - a)))
-                    area += 0.5 * abs(np.dot(normals[f_idx], np.cross(p2 - a, p1 - a)))
+
+                outside_area = 0.5 * abs(np.dot(normals[f_idx], np.cross(p1 - vo, p2 - vo)))
+                inside_area = areas[f_idx] - outside_area
+                inside_area = max(0.0, min(float(areas[f_idx]), float(inside_area)))
+                area += inside_area
         return float(area)
 
     def _perimeter_at_radius(self, radius, distances_sub, dmin=None, dmax=None):
@@ -895,48 +966,165 @@ class FastCorticalWiringAnalysis:
                         perim += float(best_d)
         return float(perim)
 
-    def _find_radius_for_area(self, distances_sub, target_area, tol=0.01, max_iter=30, dmin=None, dmax=None):
+    def _find_radius_for_area(
+        self,
+        distances_sub,
+        target_area,
+        tol=0.01,
+        max_iter=30,
+        dmin=None,
+        dmax=None,
+        r_init=None,
+        delta0=None,
+        expand_factor=1.6,
+        max_expand=25,
+    ):
         """
-        Find the geodesic radius that encompasses exactly the target area.
-        
-        Uses binary search (bisection method) to solve the inverse problem:
-        Given target area A, find radius r such that area_inside_radius(r) ≈ A.
-        
-        This is the key computation for the radius function in Ecker et al. 2013.
+        Find geodesic radius r such that area_inside_radius(r) ≈ target_area.
+
+        Optional warm-start around r_init plus bracket expansion are used to
+        accelerate convergence while preserving exact bisection solving.
         """
         valid = np.isfinite(distances_sub)
         if not np.any(valid):
             return np.nan
-            
+
+        # Precompute per-face min/max distance if not provided (used for fast face rejection)
         if dmin is None or dmax is None:
             df = distances_sub[self.faces]
             dmin = df.min(axis=1)
             dmax = df.max(axis=1)
-        
-        # Initialize search bounds
-        r_min, r_max = 0.0, float(np.max(distances_sub[valid]))
-        
-        # Check if target area is achievable
-        area_max = self._area_inside_radius(r_max, distances_sub, dmin=dmin, dmax=dmax)
-        if area_max + 1e-12 < target_area:
-            return np.nan  # Target area too large
-        
-        # Binary search for optimal radius
+
+        # Global maximum reachable distance (used for fallback/upper caps)
+        d_global_max = float(np.max(distances_sub[valid]))
+        if not np.isfinite(d_global_max) or d_global_max <= 0:
+            return np.nan
+
+        # Quick feasibility check: even at max radius, can we reach target_area?
+        area_at_max = self._area_inside_radius(d_global_max, distances_sub, dmin=dmin, dmax=dmax)
+        if area_at_max + 1e-12 < target_area:
+            return np.nan  # target too large for this (sub)mesh / disconnected distances
+
+        # Helper to compute area (kept local to avoid attribute lookups in tight loops)
+        def area_inside(r):
+            return self._area_inside_radius(r, distances_sub, dmin=dmin, dmax=dmax)
+
+        # ---------------------------------------------------------------------
+        # Bracketing
+        # ---------------------------------------------------------------------
+        if r_init is None or not np.isfinite(r_init):
+            # Backward-compatible behavior: conservative global bracket
+            r_min, r_max = 0.0, d_global_max
+        else:
+            # Choose a small initial delta0 if not provided.
+            # Use a mesh-scale heuristic: a few times the median edge length.
+            if delta0 is None or not np.isfinite(delta0) or delta0 <= 0:
+                # self.edge_lengths_sub may be present; median is robust.
+                # Fallback if missing: use 1% of global max distance.
+                if hasattr(self, "edge_lengths_sub") and self.edge_lengths_sub is not None and len(self.edge_lengths_sub) > 0:
+                    med_edge = float(np.median(self.edge_lengths_sub))
+                    delta0 = max(5.0 * med_edge, 0.01 * d_global_max)
+                else:
+                    delta0 = 0.01 * d_global_max
+
+            r_min = max(0.0, float(r_init) - float(delta0))
+            r_max = min(d_global_max, float(r_init) + float(delta0))
+
+            # Ensure non-degenerate
+            if r_max <= r_min + 1e-12:
+                r_min = max(0.0, float(r_init) - 2.0 * float(delta0))
+                r_max = min(d_global_max, float(r_init) + 2.0 * float(delta0))
+
+            # Expand upper bound until area(r_max) >= target_area
+            a_min = area_inside(r_min) if r_min > 0 else 0.0
+            a_max = area_inside(r_max)
+
+            # If r_min already too big (area above target), shrink r_min down toward 0
+            if a_min > target_area:
+                r_min = 0.0
+                a_min = 0.0
+
+            n_expand = 0
+            while a_max + 1e-12 < target_area and r_max < d_global_max and n_expand < max_expand:
+                # Expand upward
+                new_r_max = min(d_global_max, r_max * expand_factor + 1e-12)
+                if new_r_max <= r_max + 1e-12:
+                    break
+                r_max = new_r_max
+                a_max = area_inside(r_max)
+                n_expand += 1
+
+            # If expansion failed to bracket for some reason, fall back to global upper bound
+            if a_max + 1e-12 < target_area:
+                r_min, r_max = 0.0, d_global_max
+
+        # ---------------------------------------------------------------------
+        # Bisection
+        # ---------------------------------------------------------------------
+        # If target_area is tiny, return ~0
+        if target_area <= 0:
+            return 0.0
+
         for _ in range(max_iter):
             r_mid = 0.5 * (r_min + r_max)
-            area = self._area_inside_radius(r_mid, distances_sub, dmin=dmin, dmax=dmax)
-            
-            # Check convergence
-            if target_area > 0 and abs(area - target_area) / target_area < tol:
+            a_mid = area_inside(r_mid)
+
+            # Convergence: relative area error
+            if abs(a_mid - target_area) / target_area < tol:
                 return r_mid
-                
-            # Update search bounds
-            if area < target_area:
+
+            if a_mid < target_area:
                 r_min = r_mid
             else:
                 r_max = r_mid
-                
+
         return 0.5 * (r_min + r_max)
+
+    def _build_vertex_adjacency(self):
+        """
+        Build submesh vertex adjacency list from triangle faces.
+        """
+        n = self.vertices.shape[0]
+        adj = [set() for _ in range(n)]
+        for a, b, c in self.faces:
+            ia = int(a); ib = int(b); ic = int(c)
+            adj[ia].add(ib); adj[ia].add(ic)
+            adj[ib].add(ia); adj[ib].add(ic)
+            adj[ic].add(ia); adj[ic].add(ib)
+        return [sorted(list(s)) for s in adj]
+
+    def _bfs_order_all(self, start=0):
+        """
+        BFS traversal order over all components of the submesh graph.
+        """
+        adj = self._build_vertex_adjacency()
+        n = len(adj)
+        visited = np.zeros(n, dtype=bool)
+        order = []
+
+        def bfs_from(s):
+            q = deque([s])
+            visited[s] = True
+            while q:
+                v = q.popleft()
+                order.append(v)
+                for nb in adj[v]:
+                    if not visited[nb]:
+                        visited[nb] = True
+                        q.append(nb)
+
+        try:
+            s0_candidate = int(start)
+        except Exception:
+            s0_candidate = 0
+        s0 = s0_candidate if 0 <= s0_candidate < n else 0
+        bfs_from(s0)
+
+        for v in range(n):
+            if not visited[v]:
+                bfs_from(v)
+
+        return order, adj
 
     # ========================================================================
     # PUBLIC COMPUTATION METHODS
@@ -967,8 +1155,12 @@ class FastCorticalWiringAnalysis:
         target_area = total_area * float(scale)
         print(f"Target area for local measures: {target_area:.2f} mm² ({scale*100:.2f}% of {total_area:.2f} mm²)")
 
-        # Single loop over all cortical vertices
-        for sub_idx in tqdm(range(self.n_vertices), desc="Computing wiring costs"):
+        order_sub, adj = self._bfs_order_all(start=0)
+        r_sub = np.full(self.n_vertices, np.nan, dtype=np.float32)
+        r_euclid = float(np.sqrt(target_area / np.pi)) if target_area > 0 else 0.0
+
+        # Single loop over all cortical vertices (BFS order for warm-start locality)
+        for sub_idx in tqdm(order_sub, desc="Computing wiring costs"):
             # 1. Compute geodesic distances FROM this vertex ONCE
             d_sub = self._compute_geodesic_distances_from_subvertex(sub_idx)
             orig_idx = self.sub_to_orig[sub_idx]
@@ -976,12 +1168,12 @@ class FastCorticalWiringAnalysis:
             # 2. Compute MSD from the distance vector (if requested)
             if compute_msd:
                 valid = (d_sub > self.eps) & np.isfinite(d_sub)
-            if np.any(valid):
-                w = self.vertex_areas_sub[valid]      # submesh areas align with d_sub
-                msd_val = float((d_sub[valid] * w).sum() / w.sum())
-            else:
-                msd_val = np.nan
-            self.msd[orig_idx] = np.float32(msd_val)
+                if np.any(valid):
+                    w = self.vertex_areas_sub[valid]      # submesh areas align with d_sub
+                    msd_val = float((d_sub[valid] * w).sum() / w.sum())
+                else:
+                    msd_val = np.nan
+                self.msd[orig_idx] = np.float32(msd_val)
 
             # 3. Compute Local Wiring Costs from the SAME distance vector
             # Precompute min/max distances per face for efficiency
@@ -989,10 +1181,25 @@ class FastCorticalWiringAnalysis:
             dmin = df.min(axis=1)
             dmax = df.max(axis=1)
 
+            # Warm-start radius from previously solved neighbors (median is robust)
+            solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
+            if solved_neighbor_r:
+                r_init = float(np.median(np.asarray(solved_neighbor_r, dtype=np.float64)))
+            else:
+                r_init = r_euclid
+
             # Find radius that gives target area
-            r = self._find_radius_for_area(d_sub, target_area, tol=area_tol, dmin=dmin, dmax=dmax)
+            r = self._find_radius_for_area(
+                d_sub,
+                target_area,
+                tol=area_tol,
+                dmin=dmin,
+                dmax=dmax,
+                r_init=r_init,
+            )
             if not np.isfinite(r):
                 # If radius can't be found, local costs are NaN. MSD may still be valid.
+                r_sub[sub_idx] = np.nan
                 self.radius_function[orig_idx] = np.nan
                 self.perimeter_function[orig_idx] = np.nan
                 continue
@@ -1001,6 +1208,7 @@ class FastCorticalWiringAnalysis:
             perim = self._perimeter_at_radius(r, d_sub, dmin=dmin, dmax=dmax)
 
             # Store results in full mesh arrays
+            r_sub[sub_idx] = np.float32(r)
             self.radius_function[orig_idx] = np.float32(r)
             self.perimeter_function[orig_idx] = np.float32(perim)
 
