@@ -95,7 +95,7 @@ def main():
     parser.add_argument("--fs-home", default=os.environ.get("FREESURFER_HOME", "/usr/local/freesurfer"), 
                         help="Path to FreeSurfer installation")
     parser.add_argument("--fastcw-path", default=str(Path(__file__).parent.resolve() / "fastcw_pp3d.py"), 
-                        help="Path to the fastcw_pp3d.py script")
+                        help="By default the path to the fastcw_pp3d.py script. If using legacy fastcw.py script, use this flag with fastcw.py")
     parser.add_argument("--venv-python", default=sys.executable, 
                         help="Path to the Python executable")
 
