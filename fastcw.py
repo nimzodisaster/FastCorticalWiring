@@ -37,7 +37,7 @@ def _resolve_output_kinds(output_format, standard):
     raise ValueError(f"Unsupported output format: {output_format}")
 
 
-def _resolve_naming(metadata, output_dir, output_basename=None):
+def _resolve_naming(metadata, output_dir, output_basename=None, suffix=""):
     output_dir_abs = os.path.abspath(output_dir)
     positional_fs_mode = bool(metadata.get("legacy_mode", False))
     subject_dir = metadata.get("subject_dir")
@@ -47,16 +47,16 @@ def _resolve_naming(metadata, output_dir, output_basename=None):
 
     if positional_fs_mode and subject_dir and subject_id and hemi and surf_type:
         standard_surf_dir = os.path.abspath(os.path.join(subject_dir, subject_id, "surf"))
-        csv_filename = f"{subject_id}_{hemi}_{surf_type}_wiring_costs.csv"
+        csv_filename = f"{subject_id}_{hemi}_{surf_type}{suffix}_wiring_costs.csv"
         if output_dir_abs == standard_surf_dir:
-            scalar_stem = f"{hemi}.{surf_type}.{{metric}}"
+            scalar_stem = f"{hemi}.{surf_type}{suffix}.{{metric}}"
         else:
-            scalar_stem = f"{subject_id}_{hemi}_{surf_type}.{{metric}}"
+            scalar_stem = f"{subject_id}_{hemi}_{surf_type}{suffix}.{{metric}}"
         return csv_filename, scalar_stem
 
     base = output_basename or metadata.get("output_basename") or infer_output_basename(metadata.get("surface_path"))
-    csv_filename = f"{base}_wiring_costs.csv"
-    scalar_stem = f"{base}.{{metric}}"
+    csv_filename = f"{base}{suffix}_wiring_costs.csv"
+    scalar_stem = f"{base}{suffix}.{{metric}}"
     return csv_filename, scalar_stem
 
 
@@ -162,8 +162,19 @@ def _run_single_surface(
     scales = FastCorticalWiringAnalysis.normalize_scales(scale)
     metric_names = _metric_names_for_scales(scales)
 
+    suffix = ""
+    if sample_vertices is not None:
+        suffix = f"_fps{int(sample_vertices)}"
+    elif vertex_list is not None:
+        suffix = "_subset"
+
     output_kinds = _resolve_output_kinds(output_format, standard)
-    csv_filename, scalar_stem = _resolve_naming(metadata, output_dir, output_basename=output_basename)
+    csv_filename, scalar_stem = _resolve_naming(
+        metadata,
+        output_dir,
+        output_basename=output_basename,
+        suffix=suffix,
+    )
     expected_files = _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem, metric_names)
     existing_files = [f for f in expected_files if os.path.exists(f)]
     if existing_files and not overwrite:

@@ -212,5 +212,37 @@ class VertexListLoadingTests(unittest.TestCase):
             self._run_single(missing)
 
 
+class NamingSuffixTests(unittest.TestCase):
+    def test_resolve_naming_appends_sampling_suffix(self):
+        metadata = {
+            "legacy_mode": False,
+            "surface_path": "/tmp/mock.surf.gii",
+            "output_basename": "mock_surface",
+        }
+        csv_filename, scalar_stem = fastcw._resolve_naming(
+            metadata,
+            output_dir="/tmp",
+            output_basename=None,
+            suffix="_fps40962",
+        )
+        self.assertEqual(csv_filename, "mock_surface_fps40962_wiring_costs.csv")
+        self.assertEqual(scalar_stem, "mock_surface_fps40962.{metric}")
+
+    def test_resolve_naming_appends_subset_suffix(self):
+        metadata = {
+            "legacy_mode": False,
+            "surface_path": "/tmp/mock.surf.gii",
+            "output_basename": "mock_surface",
+        }
+        csv_filename, scalar_stem = fastcw._resolve_naming(
+            metadata,
+            output_dir="/tmp",
+            output_basename=None,
+            suffix="_subset",
+        )
+        self.assertEqual(csv_filename, "mock_surface_subset_wiring_costs.csv")
+        self.assertEqual(scalar_stem, "mock_surface_subset.{metric}")
+
+
 if __name__ == "__main__":
     unittest.main()
