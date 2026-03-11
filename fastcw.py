@@ -319,6 +319,12 @@ def run_cli(default_engine="potpourri"):
         help="Geodesic distance engine",
     )
     parser.add_argument("--engine-kw", action="append", default=[], help="Engine-specific option as key=value (repeatable)")
+    parser.add_argument(
+        "--allow-eigen-fallback",
+        action="store_true",
+        default=False,
+        help="Allow potpourri3d Eigen fallback when SuiteSparse check fails",
+    )
 
     parser.add_argument("--output-dir", default=None, help="Output directory")
     parser.add_argument("--hemispheres", nargs="+", default=["lh", "rh"], help="Hemispheres for positional FreeSurfer mode")
@@ -361,6 +367,8 @@ def run_cli(default_engine="potpourri"):
     args = parser.parse_args()
 
     engine_kwargs = parse_engine_kwargs(args.engine_kw)
+    if args.allow_eigen_fallback:
+        engine_kwargs["allow_eigen_fallback"] = True
     using_explicit_surface = args.surface is not None
     using_positional_fs_mode = (args.subject_dir is not None) and (args.subject_id is not None) and (not using_explicit_surface)
 

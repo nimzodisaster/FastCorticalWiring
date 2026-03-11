@@ -17,7 +17,7 @@ High-performance Python tools for computing intrinsic cortical wiring metrics fr
 After SuiteSparse/CMake are installed, install `potpourri3d` from source:
 
 ```bash
-python -m pip install potpourri3d --no-binary potpourri3d
+pip install -vvv --no-cache-dir --no-binary potpourri3d potpourri3d
 ```
 
 This source build behavior is also enforced in `requirements.txt`.

@@ -20,6 +20,7 @@ class EngineCliParsingTests(unittest.TestCase):
         self.assertNotIn("{potpourri,legacy,pygeodesic}", text)
         self.assertNotIn("--visualize", text)
         self.assertIn("--scale SCALE [SCALE ...]", text)
+        self.assertIn("--allow-eigen-fallback", text)
 
     def test_engine_pycortex_is_accepted_by_parser(self):
         proc = subprocess.run(

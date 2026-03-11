@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from backend_check import verify_suitesparse
+
 
 class BaseDistanceEngine(ABC):
     """Minimal interface expected by the shared wiring pipeline."""
@@ -29,10 +31,27 @@ class PotpourriDistanceEngine(BaseDistanceEngine):
 
     def __init__(self, vertices, faces, **engine_kwargs):
         super().__init__(vertices, faces, **engine_kwargs)
+        allow_eigen_fallback = bool(self.engine_kwargs.pop("allow_eigen_fallback", False))
         try:
             import potpourri3d as pp3d
         except Exception as exc:
             raise ImportError("potpourri3d is required for the 'potpourri' engine.") from exc
+
+        if not allow_eigen_fallback and not verify_suitesparse():
+            raise RuntimeError(
+                "\n"
+                "==================== FASTCW BACKEND CHECK FAILED ====================\n"
+                "potpourri3d does not appear to be compiled with SuiteSparse support.\n"
+                "Running with Eigen fallback can be orders of magnitude slower.\n"
+                "\n"
+                "Fix:\n"
+                "  Reinstall with source build:\n"
+                "    python -m pip install --no-binary potpourri3d potpourri3d\n"
+                "\n"
+                "Bypass explicitly (accept slow fallback):\n"
+                "  --allow-eigen-fallback\n"
+                "====================================================================\n"
+            )
 
         kwargs = {"use_robust": True}
         kwargs.update(self.engine_kwargs)
