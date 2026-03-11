@@ -54,8 +54,6 @@ def build_fastcw_cmd(args, subject):
         cmd.append("--no-compute-msd")
     if args.overwrite:
         cmd.append("--overwrite")
-    if args.visualize:
-        cmd.append("--visualize")
     if args.output_dir:
         cmd.extend(["--output-dir", args.output_dir])
     if args.output_format:
@@ -67,7 +65,7 @@ def build_fastcw_cmd(args, subject):
     if args.vertex_list:
         cmd.extend(["--vertex-list", args.vertex_list])
 
-    cmd.extend(["--scale", str(args.scale), "--area-tol", str(args.area_tol), "--eps", str(args.eps)])
+    cmd.extend(["--scale", *[str(s) for s in args.scale], "--area-tol", str(args.area_tol), "--eps", str(args.eps)])
     for item in args.engine_kw:
         cmd.extend(["--engine-kw", item])
 
@@ -114,10 +112,15 @@ def main():
     parser.add_argument("--sample-vertices", type=int, default=None, help="Subset by FPS sample size")
     parser.add_argument("--vertex-list", default=None, help="Subset by vertex-index list file")
     parser.add_argument("--no-compute-msd", action="store_true", help="Disable MSD computation")
-    parser.add_argument("--scale", type=float, default=0.05, help="Scale for local measures")
+    parser.add_argument(
+        "--scale",
+        nargs="+",
+        type=float,
+        default=[0.001, 0.005, 0.01, 0.05],
+        help="One or more scales for local measures",
+    )
     parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area search")
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
-    parser.add_argument("--visualize", action="store_true", help="Enable FastCW visualization output")
 
     parser.add_argument("-j", "--jobs", type=int, default=14, help="Number of parallel processes")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")

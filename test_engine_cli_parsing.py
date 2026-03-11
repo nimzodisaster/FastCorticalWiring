@@ -18,6 +18,8 @@ class EngineCliParsingTests(unittest.TestCase):
         text = proc.stdout + proc.stderr
         self.assertIn("--engine {potpourri,potpourri_fmm,pycortex,pygeodesic}", text)
         self.assertNotIn("{potpourri,legacy,pygeodesic}", text)
+        self.assertNotIn("--visualize", text)
+        self.assertIn("--scale SCALE [SCALE ...]", text)
 
     def test_engine_pycortex_is_accepted_by_parser(self):
         proc = subprocess.run(
@@ -58,6 +60,24 @@ class EngineCliParsingTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         text = proc.stdout + proc.stderr
         self.assertIn("not allowed with argument", text)
+
+    def test_scale_accepts_single_value(self):
+        proc = subprocess.run(
+            [sys.executable, "fastcw.py", "--scale", "0.05", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
+
+    def test_scale_accepts_multiple_values(self):
+        proc = subprocess.run(
+            [sys.executable, "fastcw.py", "--scale", "0.01", "0.05", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":

@@ -77,8 +77,11 @@ class PyGeodesicBackendSmokeTests(unittest.TestCase):
         )
         analysis.compute_all_wiring_costs(compute_msd=False, scale=0.2, area_tol=0.1)
 
-        self.assertTrue(np.any(np.isfinite(analysis.radius_function)))
-        self.assertTrue(np.any(np.isfinite(analysis.perimeter_function)))
+        scale_key = FastCorticalWiringAnalysis.normalize_scales(0.2)[0]
+        self.assertIn(scale_key, analysis.radius_function)
+        self.assertIn(scale_key, analysis.perimeter_function)
+        self.assertTrue(np.any(np.isfinite(analysis.radius_function[scale_key])))
+        self.assertTrue(np.any(np.isfinite(analysis.perimeter_function[scale_key])))
 
 
 if __name__ == "__main__":

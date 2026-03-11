@@ -65,19 +65,29 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
             vertex_subset=[0, 2, 4, 99, -1],
         )
 
+        scale_key = FastCorticalWiringAnalysis.normalize_scales(0.2)[0]
         for idx in (0, 2):
             self.assertTrue(np.isfinite(analysis.msd[idx]))
-            self.assertTrue(np.isfinite(analysis.radius_function[idx]))
-            self.assertTrue(np.isfinite(analysis.perimeter_function[idx]))
+            self.assertTrue(np.isfinite(analysis.radius_function[scale_key][idx]))
+            self.assertTrue(np.isfinite(analysis.perimeter_function[scale_key][idx]))
 
         for idx in (1, 3, 4):
             self.assertTrue(np.isnan(analysis.msd[idx]))
-            self.assertTrue(np.isnan(analysis.radius_function[idx]))
-            self.assertTrue(np.isnan(analysis.perimeter_function[idx]))
+            self.assertTrue(np.isnan(analysis.radius_function[scale_key][idx]))
+            self.assertTrue(np.isnan(analysis.perimeter_function[scale_key][idx]))
 
 
 class _StubAnalysis:
     last_compute_kwargs = None
+    DEFAULT_SCALES = FastCorticalWiringAnalysis.DEFAULT_SCALES
+
+    @staticmethod
+    def normalize_scales(scale):
+        return FastCorticalWiringAnalysis.normalize_scales(scale)
+
+    @staticmethod
+    def scale_token(scale):
+        return FastCorticalWiringAnalysis.scale_token(scale)
 
     def __init__(
         self,
@@ -97,18 +107,34 @@ class _StubAnalysis:
         self.cortex_mask_full = np.asarray(cortex_mask, dtype=bool)
         self.n_vertices_full = n
         self.msd = np.full(n, np.nan, dtype=np.float32)
-        self.radius_function = np.full(n, np.nan, dtype=np.float32)
-        self.perimeter_function = np.full(n, np.nan, dtype=np.float32)
+        self.active_scales = tuple(self.DEFAULT_SCALES)
+        self.radius_function = {
+            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
+        }
+        self.perimeter_function = {
+            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
+        }
 
     def compute_all_wiring_costs(self, **kwargs):
         _StubAnalysis.last_compute_kwargs = dict(kwargs)
+        scales = FastCorticalWiringAnalysis.normalize_scales(kwargs.get("scale"))
+        self.active_scales = scales
+        n = self.n_vertices_full
+        self.radius_function = {
+            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
+        }
+        self.perimeter_function = {
+            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
+        }
         return self.msd, self.radius_function, self.perimeter_function
 
     def get_metric_arrays(self):
-        return {"msd": self.msd, "radius": self.radius_function, "perimeter": self.perimeter_function}
-
-    def visualize_results(self, measure="msd", output_file=None):
-        return measure, output_file
+        out = {"msd": self.msd}
+        for scale in self.active_scales:
+            token = FastCorticalWiringAnalysis.scale_token(scale)
+            out[f"radius_{token}"] = self.radius_function[float(scale)]
+            out[f"perimeter_{token}"] = self.perimeter_function[float(scale)]
+        return out
 
 
 class VertexListLoadingTests(unittest.TestCase):
@@ -156,7 +182,6 @@ class VertexListLoadingTests(unittest.TestCase):
                             area_tol=0.01,
                             eps=1e-6,
                             overwrite=True,
-                            visualize=False,
                             sample_vertices=None,
                             vertex_list=vertex_list,
                         )

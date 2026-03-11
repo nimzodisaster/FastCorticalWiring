@@ -344,6 +344,8 @@ class FastCorticalWiringAnalysis:
     - cortex_mask: (N,) boolean mask
     """
 
+    DEFAULT_SCALES = (0.001, 0.005, 0.01, 0.05)
+
     def __init__(
         self,
         vertices,
@@ -423,8 +425,45 @@ class FastCorticalWiringAnalysis:
         
         # Initialize result arrays (will be filled by computation methods)
         self.msd = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
-        self.radius_function = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
-        self.perimeter_function = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
+        self.active_scales = tuple(self.DEFAULT_SCALES)
+        self.radius_function = {
+            float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
+        }
+        self.perimeter_function = {
+            float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
+        }
+
+    @staticmethod
+    def normalize_scales(scale):
+        """Normalize scale input into an ordered tuple of unique valid fractions."""
+        if scale is None:
+            raw = list(FastCorticalWiringAnalysis.DEFAULT_SCALES)
+        elif np.isscalar(scale):
+            raw = [scale]
+        else:
+            raw = list(scale)
+
+        if not raw:
+            raise ValueError("At least one scale must be provided.")
+
+        normalized = []
+        seen = set()
+        for item in raw:
+            value = float(item)
+            if not np.isfinite(value):
+                raise ValueError(f"Invalid scale {item!r}: must be finite.")
+            if value <= 0.0 or value > 1.0:
+                raise ValueError(f"Invalid scale {item!r}: expected 0 < scale <= 1.")
+            if value not in seen:
+                seen.add(value)
+                normalized.append(value)
+
+        return tuple(normalized)
+
+    @staticmethod
+    def scale_token(scale):
+        """Stable string token for metric names and filenames."""
+        return format(float(scale), "g")
 
     @staticmethod
     def _validate_mesh_inputs(vertices, faces, cortex_mask):
@@ -1029,7 +1068,7 @@ class FastCorticalWiringAnalysis:
     # ========================================================================
 
 
-    def compute_all_wiring_costs(self, compute_msd=True, scale=0.05, area_tol=0.01, vertex_subset=None):
+    def compute_all_wiring_costs(self, compute_msd=True, scale=None, area_tol=0.01, vertex_subset=None):
         """
         Compute all wiring cost metrics (MSD, radius, perimeter) in a single pass.
 
@@ -1040,19 +1079,33 @@ class FastCorticalWiringAnalysis:
 
         Args:
             compute_msd (bool): If True, compute Mean Separation Distance.
-            scale (float): The proportion of total cortical area to use for local measures.
+            scale: Single scale or iterable of scales as proportions of total cortical area.
             area_tol (float): Relative tolerance for the area binary search.
             vertex_subset: Optional iterable of original vertex indices to compute.
         """
+        scales = self.normalize_scales(scale)
+        self.active_scales = scales
+        self.msd[:] = np.nan
+        self.radius_function = {
+            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
+        }
+        self.perimeter_function = {
+            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
+        }
+
         if compute_msd:
             print("Computing Mean Separation Distances and Local Wiring Costs...")
         else:
-            print(f"Computing Local Wiring Costs at scale {scale*100:.2f}%...")
+            scale_desc = ", ".join(f"{s*100:.2f}%" for s in scales)
+            print(f"Computing Local Wiring Costs at scales {scale_desc}...")
 
         # Calculate target area once for local measures
         total_area = float(np.sum(self.vertex_areas_sub))
-        target_area = total_area * float(scale)
-        print(f"Target area for local measures: {target_area:.2f} mm² ({scale*100:.2f}% of {total_area:.2f} mm²)")
+        target_areas = {float(s): total_area * float(s) for s in scales}
+        print("Target areas for local measures:")
+        for s in scales:
+            target_area = target_areas[float(s)]
+            print(f"  - {s*100:.2f}%: {target_area:.2f} mm² of {total_area:.2f} mm²")
 
         order_sub, adj = self._bfs_order_all(start=0)
         if vertex_subset is not None:
@@ -1072,8 +1125,11 @@ class FastCorticalWiringAnalysis:
             order_sub = [v for v in order_sub if v in subset_sub_set]
             print(f"Restricting computation to {len(order_sub)} specified vertices.")
 
-        r_sub = np.full(self.n_vertices, np.nan, dtype=np.float32)
-        r_euclid = float(np.sqrt(target_area / np.pi)) if target_area > 0 else 0.0
+        r_sub_by_scale = {float(s): np.full(self.n_vertices, np.nan, dtype=np.float32) for s in scales}
+        r_euclid_by_scale = {
+            float(s): (float(np.sqrt(target_areas[float(s)] / np.pi)) if target_areas[float(s)] > 0 else 0.0)
+            for s in scales
+        }
 
         # Single loop over all cortical vertices (BFS order for warm-start locality)
         for sub_idx in tqdm(order_sub, desc="Computing wiring costs"):
@@ -1097,36 +1153,33 @@ class FastCorticalWiringAnalysis:
             dmin = df.min(axis=1)
             dmax = df.max(axis=1)
 
-            # Warm-start radius from previously solved neighbors (median is robust)
-            solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
-            if solved_neighbor_r:
-                r_init = float(np.median(np.asarray(solved_neighbor_r, dtype=np.float64)))
-            else:
-                r_init = r_euclid
+            for s in scales:
+                scale_key = float(s)
+                r_sub = r_sub_by_scale[scale_key]
+                solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
+                if solved_neighbor_r:
+                    r_init = float(np.median(np.asarray(solved_neighbor_r, dtype=np.float64)))
+                else:
+                    r_init = r_euclid_by_scale[scale_key]
 
-            # Find radius that gives target area
-            r = self._find_radius_for_area(
-                d_sub,
-                target_area,
-                tol=area_tol,
-                dmin=dmin,
-                dmax=dmax,
-                r_init=r_init,
-            )
-            if not np.isfinite(r):
-                # If radius can't be found, local costs are NaN. MSD may still be valid.
-                r_sub[sub_idx] = np.nan
-                self.radius_function[orig_idx] = np.nan
-                self.perimeter_function[orig_idx] = np.nan
-                continue
+                r = self._find_radius_for_area(
+                    d_sub,
+                    target_areas[scale_key],
+                    tol=area_tol,
+                    dmin=dmin,
+                    dmax=dmax,
+                    r_init=r_init,
+                )
+                if not np.isfinite(r):
+                    r_sub[sub_idx] = np.nan
+                    self.radius_function[scale_key][orig_idx] = np.nan
+                    self.perimeter_function[scale_key][orig_idx] = np.nan
+                    continue
 
-            # Compute perimeter at that radius
-            perim = self._perimeter_at_radius(r, d_sub, dmin=dmin, dmax=dmax)
-
-            # Store results in full mesh arrays
-            r_sub[sub_idx] = np.float32(r)
-            self.radius_function[orig_idx] = np.float32(r)
-            self.perimeter_function[orig_idx] = np.float32(perim)
+                perim = self._perimeter_at_radius(r, d_sub, dmin=dmin, dmax=dmax)
+                r_sub[sub_idx] = np.float32(r)
+                self.radius_function[scale_key][orig_idx] = np.float32(r)
+                self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
 
         # Print summary statistics at the end
         if compute_msd:
@@ -1134,88 +1187,33 @@ class FastCorticalWiringAnalysis:
             if valid_msd.size:
                 print(f"MSD stats: min={np.min(valid_msd):.2f}, max={np.max(valid_msd):.2f}, mean={np.mean(valid_msd):.2f}")
 
-        vr = self.radius_function[np.isfinite(self.radius_function)]
-        vp = self.perimeter_function[np.isfinite(self.perimeter_function)]
-        if vr.size:
-            print(f"Radius stats: min={np.min(vr):.2f}, max={np.max(vr):.2f}, mean={np.mean(vr):.2f}")
-        if vp.size:
-            print(f"Perimeter stats: min={np.min(vp):.2f}, max={np.max(vp):.2f}, mean={np.mean(vp):.2f}")
+        for s in scales:
+            scale_key = float(s)
+            vr = self.radius_function[scale_key][np.isfinite(self.radius_function[scale_key])]
+            vp = self.perimeter_function[scale_key][np.isfinite(self.perimeter_function[scale_key])]
+            if vr.size:
+                print(
+                    f"Radius stats @ {s*100:.2f}%: "
+                    f"min={np.min(vr):.2f}, max={np.max(vr):.2f}, mean={np.mean(vr):.2f}"
+                )
+            if vp.size:
+                print(
+                    f"Perimeter stats @ {s*100:.2f}%: "
+                    f"min={np.min(vp):.2f}, max={np.max(vp):.2f}, mean={np.mean(vp):.2f}"
+                )
 
         return self.msd, self.radius_function, self.perimeter_function
             
     # ========================================================================
-    # INPUT/OUTPUT AND VISUALIZATION
+    # INPUT/OUTPUT
     # ========================================================================
     
     def get_metric_arrays(self):
         """Return computed metric arrays in a standard mapping."""
-        return {
-            "msd": self.msd,
-            "radius": self.radius_function,
-            "perimeter": self.perimeter_function,
-        }
-
-    def visualize_results(self, measure='msd', output_file=None):
-        """
-        Create 3D scatter plot and histogram visualization of computed measures.
-        
-        Shows spatial distribution of wiring costs across the cortical surface
-        and the statistical distribution of values.
-        """
-        try:
-            import matplotlib.pyplot as plt
-        except Exception as exc:
-            raise ImportError("matplotlib is required for visualization. Install with: pip install matplotlib") from exc
-
-        if measure == 'msd':
-            data = self.msd
-            title = 'Mean Separation Distances'
-        elif measure == 'radius':
-            data = self.radius_function
-            title = 'Radius Function'
-        elif measure == 'perimeter':
-            data = self.perimeter_function
-            title = 'Perimeter Function'
-        else:
-            raise ValueError(f"Unknown measure: {measure}")
-        
-        if data is None:
-            print(f"Measure {measure} has not been computed yet")
-            return
-        
-        # Prepare visualization data (mask non-cortical vertices)
-        vis_data = data.copy()
-        vis_data[~self.cortex_mask_full] = np.nan
-        
-        fig = plt.figure(figsize=(12, 8))
-        
-        # 3D scatter plot of cortical surface
-        ax = fig.add_subplot(121, projection='3d')
-        cortex_vertices = self.vertices_full[self.cortex_mask_full]
-        cortex_data = vis_data[self.cortex_mask_full]
-        p = ax.scatter(cortex_vertices[:, 0], cortex_vertices[:, 1], cortex_vertices[:, 2], 
-                      c=cortex_data, cmap='coolwarm', s=1)
-        ax.set_title(f'{title} - {self.hemi} hemisphere')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y') 
-        ax.set_zlabel('Z')
-        plt.colorbar(p, ax=ax, fraction=0.046, pad=0.04)
-        
-        # Histogram of values
-        ax2 = fig.add_subplot(122)
-        valid_data = vis_data[np.isfinite(vis_data)]
-        ax2.hist(valid_data, bins=50, edgecolor='black')
-        ax2.set_xlabel(measure.upper())
-        ax2.set_ylabel('Number of vertices')
-        ax2.set_title(f'Distribution of {title}')
-        if valid_data.size:
-            ax2.axvline(np.mean(valid_data), color='red', linestyle='--', 
-                       label=f'Mean: {np.mean(valid_data):.2f}')
-            ax2.legend()
-        
-        plt.tight_layout()
-        if output_file:
-            plt.savefig(output_file, dpi=150, bbox_inches='tight')
-            print(f"Figure saved to: {output_file}")
-        else:
-            plt.show()
+        out = {"msd": self.msd}
+        for scale in self.active_scales:
+            scale_key = float(scale)
+            token = self.scale_token(scale_key)
+            out[f"radius_{token}"] = self.radius_function[scale_key]
+            out[f"perimeter_{token}"] = self.perimeter_function[scale_key]
+        return out

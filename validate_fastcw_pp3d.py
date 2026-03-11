@@ -671,6 +671,7 @@ def validate_surface(base_dir, subject_id, cfg, run_integration=False):
         ref_perim = float(cfg["perim_fn"](ref_r))
         scale = ref_area / float(np.sum(analysis.vertex_areas_sub))
         analysis.compute_all_wiring_costs(compute_msd=False, scale=scale, area_tol=1e-3)
+        scale_key = FastCorticalWiringAnalysis.normalize_scales(scale)[0]
 
         eligible = np.ones(test_vertices.shape[0], dtype=bool)
         if cfg.get("shape") == "plane":
@@ -698,8 +699,8 @@ def validate_surface(base_dir, subject_id, cfg, run_integration=False):
                 eligible = z <= (0.5 * H - ref_r - margin)
 
         eligible_vertices = test_vertices[eligible]
-        r_vals = analysis.radius_function[eligible_vertices]
-        p_vals = analysis.perimeter_function[eligible_vertices]
+        r_vals = analysis.radius_function[scale_key][eligible_vertices]
+        p_vals = analysis.perimeter_function[scale_key][eligible_vertices]
         valid_mask = np.isfinite(r_vals) & np.isfinite(p_vals)
         if eligible_vertices.size > 0 and np.any(valid_mask):
             int_radius_err = np.abs(r_vals[valid_mask] - ref_r) / max(1e-12, abs(ref_r))

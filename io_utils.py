@@ -285,15 +285,37 @@ def save_results_csv(output_dir, csv_filename, cortex_mask, msd, radius_function
     path = os.path.join(output_dir, csv_filename)
 
     n_vertices = int(len(cortex_mask))
-    if len(msd) != n_vertices or len(radius_function) != n_vertices or len(perimeter_function) != n_vertices:
-        raise ValueError("All metric arrays must match cortex_mask length for CSV output.")
+    if len(msd) != n_vertices:
+        raise ValueError("MSD array must match cortex_mask length for CSV output.")
+    if not isinstance(radius_function, dict) or not isinstance(perimeter_function, dict):
+        raise ValueError("radius_function and perimeter_function must be dicts keyed by scale.")
+    if set(radius_function.keys()) != set(perimeter_function.keys()):
+        raise ValueError("radius_function and perimeter_function must share the same scale keys.")
+
+    scale_keys = list(radius_function.keys())
+    radius_arrays = {}
+    perimeter_arrays = {}
+    for scale_key in scale_keys:
+        r_arr = np.asarray(radius_function[scale_key])
+        p_arr = np.asarray(perimeter_function[scale_key])
+        if r_arr.shape[0] != n_vertices or p_arr.shape[0] != n_vertices:
+            raise ValueError("All metric arrays must match cortex_mask length for CSV output.")
+        radius_arrays[scale_key] = r_arr
+        perimeter_arrays[scale_key] = p_arr
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("vertex_id,is_cortex,msd,radius_function,perimeter_function\n")
+        header = ["vertex_id", "is_cortex", "msd"]
+        for scale_key in scale_keys:
+            token = format(float(scale_key), "g")
+            header.append(f"radius_{token}")
+            header.append(f"perimeter_{token}")
+        f.write(",".join(header) + "\n")
         for i in range(n_vertices):
-            f.write(
-                f"{i},{int(bool(cortex_mask[i]))},{float(msd[i])},{float(radius_function[i])},{float(perimeter_function[i])}\n"
-            )
+            fields = [str(i), str(int(bool(cortex_mask[i]))), str(float(msd[i]))]
+            for scale_key in scale_keys:
+                fields.append(str(float(radius_arrays[scale_key][i])))
+                fields.append(str(float(perimeter_arrays[scale_key][i])))
+            f.write(",".join(fields) + "\n")
     return path
 
 

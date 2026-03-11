@@ -9,7 +9,14 @@ import numpy as np
 from core_analysis import FastCorticalWiringAnalysis
 from io_utils import farthest_point_sampling, infer_output_basename
 
-METRIC_NAMES = ("msd", "radius", "perimeter")
+
+def _metric_names_for_scales(scales):
+    names = ["msd"]
+    for scale in scales:
+        token = FastCorticalWiringAnalysis.scale_token(scale)
+        names.append(f"radius_{token}")
+        names.append(f"perimeter_{token}")
+    return tuple(names)
 
 
 def _resolve_output_kinds(output_format, standard):
@@ -45,23 +52,22 @@ def _resolve_naming(metadata, output_dir, output_basename=None):
             scalar_stem = f"{hemi}.{surf_type}.{{metric}}"
         else:
             scalar_stem = f"{subject_id}_{hemi}_{surf_type}.{{metric}}"
-        viz_base = f"{subject_id}_{hemi}_{surf_type}"
-        return csv_filename, scalar_stem, viz_base
+        return csv_filename, scalar_stem
 
     base = output_basename or metadata.get("output_basename") or infer_output_basename(metadata.get("surface_path"))
     csv_filename = f"{base}_wiring_costs.csv"
     scalar_stem = f"{base}.{{metric}}"
-    return csv_filename, scalar_stem, base
+    return csv_filename, scalar_stem
 
 
-def _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem):
+def _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem, metric_names):
     out = []
     if "csv" in output_kinds:
         out.append(os.path.join(output_dir, csv_filename))
     if "mgh" in output_kinds:
-        out.extend([os.path.join(output_dir, f"{scalar_stem.format(metric=m)}.mgh") for m in METRIC_NAMES])
+        out.extend([os.path.join(output_dir, f"{scalar_stem.format(metric=m)}.mgh") for m in metric_names])
     if "gii" in output_kinds:
-        out.extend([os.path.join(output_dir, f"{scalar_stem.format(metric=m)}.shape.gii") for m in METRIC_NAMES])
+        out.extend([os.path.join(output_dir, f"{scalar_stem.format(metric=m)}.shape.gii") for m in metric_names])
     return out
 
 
@@ -128,7 +134,6 @@ def _run_single_surface(
     area_tol,
     eps,
     overwrite,
-    visualize,
     sample_vertices=None,
     vertex_list=None,
 ):
@@ -154,9 +159,12 @@ def _run_single_surface(
         else:
             output_dir = os.getcwd()
 
+    scales = FastCorticalWiringAnalysis.normalize_scales(scale)
+    metric_names = _metric_names_for_scales(scales)
+
     output_kinds = _resolve_output_kinds(output_format, standard)
-    csv_filename, scalar_stem, viz_base = _resolve_naming(metadata, output_dir, output_basename=output_basename)
-    expected_files = _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem)
+    csv_filename, scalar_stem = _resolve_naming(metadata, output_dir, output_basename=output_basename)
+    expected_files = _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem, metric_names)
     existing_files = [f for f in expected_files if os.path.exists(f)]
     if existing_files and not overwrite:
         print("ERROR: Output files already exist:")
@@ -189,19 +197,11 @@ def _run_single_surface(
     )
     analysis.compute_all_wiring_costs(
         compute_msd=compute_msd,
-        scale=scale,
+        scale=scales,
         area_tol=area_tol,
         vertex_subset=vertex_subset,
     )
     written = _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, scalar_stem)
-
-    if visualize:
-        if compute_msd and np.any(np.isfinite(analysis.msd)):
-            analysis.visualize_results("msd", os.path.join(output_dir, f"{viz_base}_msd.png"))
-        if np.any(np.isfinite(analysis.radius_function)):
-            analysis.visualize_results("radius", os.path.join(output_dir, f"{viz_base}_radius.png"))
-        if np.any(np.isfinite(analysis.perimeter_function)):
-            analysis.visualize_results("perimeter", os.path.join(output_dir, f"{viz_base}_perimeter.png"))
 
     return written
 
@@ -214,11 +214,10 @@ def process_subject(
     surf_type="pial",
     custom_label=None,
     compute_msd=True,
-    scale=0.05,
+    scale=FastCorticalWiringAnalysis.DEFAULT_SCALES,
     area_tol=0.01,
     eps=1e-6,
     overwrite=False,
-    visualize=False,
     output_format="auto",
     engine_type="potpourri",
     engine_kwargs=None,
@@ -261,7 +260,6 @@ def process_subject(
             area_tol=area_tol,
             eps=eps,
             overwrite=overwrite,
-            visualize=visualize,
             sample_vertices=sample_vertices,
             vertex_list=vertex_list,
         )
@@ -336,10 +334,15 @@ def run_cli(default_engine="potpourri"):
         help="Custom cortex label name for non-standard FreeSurfer surfaces (e.g., cortex6 for {hemi}.cortex6.label)",
     )
     parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite existing output files")
-    parser.add_argument("--visualize", action="store_true", default=False, help="Generate visualization PNG files")
     parser.add_argument("--compute-msd", dest="compute_msd", action="store_true", default=True, help="Compute MSDs")
     parser.add_argument("--no-compute-msd", dest="compute_msd", action="store_false", help="Disable MSD computation")
-    parser.add_argument("--scale", type=float, default=0.05, help="Scale for local measures as proportion of total area")
+    parser.add_argument(
+        "--scale",
+        nargs="+",
+        type=float,
+        default=list(FastCorticalWiringAnalysis.DEFAULT_SCALES),
+        help="One or more scales for local measures as proportions of total area",
+    )
     parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area binary search")
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
     subset_group = parser.add_mutually_exclusive_group()
@@ -386,7 +389,6 @@ def run_cli(default_engine="potpourri"):
             area_tol=args.area_tol,
             eps=args.eps,
             overwrite=args.overwrite,
-            visualize=args.visualize,
             sample_vertices=args.sample_vertices,
             vertex_list=args.vertex_list,
         )
@@ -417,7 +419,6 @@ def run_cli(default_engine="potpourri"):
             area_tol=args.area_tol,
             eps=args.eps,
             overwrite=args.overwrite,
-            visualize=args.visualize,
             output_format=args.output_format,
             engine_type=args.engine,
             engine_kwargs=engine_kwargs,

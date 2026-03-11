@@ -183,12 +183,11 @@ Common options:
 --hemispheres lh rh
 --surf-type pial
 --custom-label cortex
---scale 0.05
+--scale 0.001 0.005 0.01 0.05
 --area-tol 0.01
 --engine potpourri|pygeodesic|pycortex
 --no-compute-msd
 --overwrite
---visualize
 ```
 
 Example:
@@ -196,7 +195,7 @@ Example:
 ```
 python fastcw.py $SUBJECTS_DIR fsaverage \
   --hemispheres lh rh \
-  --scale 0.05
+  --scale 0.01 0.05
 ```
 
 ---
