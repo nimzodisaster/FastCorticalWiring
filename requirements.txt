@@ -1,11 +1,10 @@
-# Core runtime
+# Core runtime (default FastCW pipeline)
 numpy
 nibabel
-pandas
-matplotlib
 tqdm
-pycortex
-
-# Optional exact-reference backend:
-# pygeodesic
+potpourri3d
 numba
+matplotlib
+pycortex
+pygeodesic
+scipy
