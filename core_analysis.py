@@ -48,10 +48,70 @@ except Exception:
 # ============================================================================
 
 if NUMBA_AVAILABLE:
-    
-    # (_sign_eps, _edge_intersection_point, _farthest_pair, and 
-    # _triangle_area_with_unit_normal remain exactly the same)
-    
+    @njit(fastmath=True, cache=True)
+    def _sign_eps(x, eps):
+        if x < -eps:
+            return -1
+        if x > eps:
+            return 1
+        return 0
+
+    @njit(fastmath=True, cache=True)
+    def _edge_intersection_point(pi, pj, di, dj, r, abs_tol):
+        if abs(di - r) <= abs_tol:
+            return pi[0], pi[1], pi[2], True
+        if abs(dj - r) <= abs_tol:
+            return pj[0], pj[1], pj[2], True
+
+        denom = dj - di
+        if abs(denom) < 1e-20:
+            return 0.0, 0.0, 0.0, False
+
+        t = (r - di) / denom
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+
+        return (
+            pi[0] + (pj[0] - pi[0]) * t,
+            pi[1] + (pj[1] - pi[1]) * t,
+            pi[2] + (pj[2] - pi[2]) * t,
+            True,
+        )
+
+    @njit(fastmath=True, cache=True)
+    def _farthest_pair(P, m):
+        best_i = 0
+        best_j = 1
+        best_d = -1.0
+
+        for i in range(m):
+            for j in range(i + 1, m):
+                dx = P[j, 0] - P[i, 0]
+                dy = P[j, 1] - P[i, 1]
+                dz = P[j, 2] - P[i, 2]
+                d2 = dx * dx + dy * dy + dz * dz
+                if d2 > best_d:
+                    best_d = d2
+                    best_i = i
+                    best_j = j
+        return best_i, best_j, best_d ** 0.5
+
+    @njit(fastmath=True, cache=True)
+    def _triangle_area_with_unit_normal(a, b, c, n):
+        v1x = b[0] - a[0]
+        v1y = b[1] - a[1]
+        v1z = b[2] - a[2]
+        v2x = c[0] - a[0]
+        v2y = c[1] - a[1]
+        v2z = c[2] - a[2]
+
+        cx = v1y * v2z - v1z * v2y
+        cy = v1z * v2x - v1x * v2z
+        cz = v1x * v2y - v1y * v2x
+        return 0.5 * abs(n[0] * cx + n[1] * cy + n[2] * cz)
+
     @njit(fastmath=True, cache=True)
     def _area_inside_radius_kernel(V, F, unit_normals, face_areas, face_L, distances, r, eps, cand_idx):
         area_sum = 0.0
