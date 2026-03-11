@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Geodesic distance engine adapters for FastCorticalWiring."""
+
+from abc import ABC, abstractmethod
+
+import numpy as np
+
+
+class BaseDistanceEngine(ABC):
+    """Minimal interface expected by the shared wiring pipeline."""
+
+    def __init__(self, vertices, faces, **engine_kwargs):
+        self.vertices = np.ascontiguousarray(vertices, dtype=np.float64)
+        self.faces = np.ascontiguousarray(faces, dtype=np.int32)
+        self.engine_kwargs = dict(engine_kwargs or {})
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def compute_distance(self, source_idx: int) -> np.ndarray:
+        raise NotImplementedError
+
+
+class PotpourriDistanceEngine(BaseDistanceEngine):
+    """potpourri3d heat-method solver adapter."""
+
+    def __init__(self, vertices, faces, **engine_kwargs):
+        super().__init__(vertices, faces, **engine_kwargs)
+        try:
+            import potpourri3d as pp3d
+        except Exception as exc:
+            raise ImportError("potpourri3d is required for the 'potpourri' engine.") from exc
+
+        kwargs = {"use_robust": True}
+        kwargs.update(self.engine_kwargs)
+        self._solver = pp3d.MeshHeatMethodDistanceSolver(self.vertices, self.faces, **kwargs)
+
+    @property
+    def name(self) -> str:
+        return "potpourri"
+
+    def compute_distance(self, source_idx: int) -> np.ndarray:
+        d = self._solver.compute_distance(int(source_idx))
+        return np.ascontiguousarray(np.asarray(d, dtype=np.float64))
+
+
+class PotpourriFmmDistanceEngine(BaseDistanceEngine):
+    """potpourri3d Fast Marching Method solver adapter."""
+
+    def __init__(self, vertices, faces, **engine_kwargs):
+        super().__init__(vertices, faces, **engine_kwargs)
+        try:
+            import potpourri3d as pp3d
+        except ImportError as exc:
+            raise ImportError("potpourri3d is required for the 'potpourri_fmm' engine.") from exc
+
+        self._solver = pp3d.MeshFastMarchingDistanceSolver(
+            self.vertices,
+            self.faces,
+            **self.engine_kwargs,
+        )
+
+    @property
+    def name(self) -> str:
+        return "potpourri_fmm"
+
+    def compute_distance(self, source_idx: int) -> np.ndarray:
+        src = int(source_idx)
+        n_vertices = self.vertices.shape[0]
+
+        if src < 0 or src >= n_vertices:
+            raise ValueError(f"source_idx out of range: {src} for mesh with {n_vertices} vertices")
+
+        d = self._solver.compute_distance(src)
+        d = np.asarray(d, dtype=np.float64)
+
+        if d.ndim != 1 or d.shape[0] != n_vertices:
+            raise ValueError(
+                f"potpourri_fmm returned invalid distance shape {d.shape}; expected ({n_vertices},)"
+            )
+        return np.ascontiguousarray(d)
+
+
+class PycortexDistanceEngine(BaseDistanceEngine):
+    """pycortex geodesic solver adapter."""
+
+    def __init__(self, vertices, faces, **engine_kwargs):
+        super().__init__(vertices, faces, **engine_kwargs)
+        try:
+            from cortex.polyutils import Surface
+        except Exception as exc:
+            raise ImportError(
+                "pycortex backend requested but pycortex is not installed. "
+                "Install with: pip install pycortex"
+            ) from exc
+
+        if self.engine_kwargs:
+            # pycortex Surface currently does not consume kwargs; keep localized and explicit.
+            unsupported = ", ".join(sorted(self.engine_kwargs.keys()))
+            raise ValueError(f"Unsupported engine kwargs for pycortex engine: {unsupported}")
+        self._surface = Surface(self.vertices, self.faces)
+
+    @property
+    def name(self) -> str:
+        return "pycortex"
+
+    def compute_distance(self, source_idx: int) -> np.ndarray:
+        d = self._surface.geodesic_distance([int(source_idx)])
+        d = np.asarray(d, dtype=np.float64)
+        if d.ndim != 1 or d.shape[0] != self.vertices.shape[0]:
+            raise ValueError(
+                f"pycortex engine returned invalid distance shape {d.shape}; "
+                f"expected ({self.vertices.shape[0]},)"
+            )
+        return np.ascontiguousarray(d)
+
+
+class PyGeodesicDistanceEngine(BaseDistanceEngine):
+    """Exact discrete geodesic solver adapter via pygeodesic."""
+
+    def __init__(self, vertices, faces, **engine_kwargs):
+        super().__init__(vertices, faces, **engine_kwargs)
+        try:
+            import pygeodesic.geodesic as geodesic
+        except Exception as exc:
+            raise ImportError(
+                "pygeodesic backend requested but pygeodesic is not installed. "
+                "Install with: pip install pygeodesic"
+            ) from exc
+
+        if self.engine_kwargs:
+            unsupported = ", ".join(sorted(self.engine_kwargs.keys()))
+            raise ValueError(f"Unsupported engine kwargs for pygeodesic engine: {unsupported}")
+
+        self._solver = geodesic.PyGeodesicAlgorithmExact(self.vertices, self.faces)
+
+    @property
+    def name(self) -> str:
+        return "pygeodesic"
+
+    def compute_distance(self, source_idx: int) -> np.ndarray:
+        src = int(source_idx)
+        n_vertices = self.vertices.shape[0]
+        if src < 0 or src >= n_vertices:
+            raise ValueError(f"source_idx out of range: {src} for mesh with {n_vertices} vertices")
+
+        source_indices = np.asarray([src], dtype=np.int32)
+        distances, _ = self._solver.geodesicDistances(source_indices, None)
+        d = np.asarray(distances, dtype=np.float64)
+        if d.ndim != 1 or d.shape[0] != n_vertices:
+            raise ValueError(
+                f"pygeodesic returned invalid distance shape {d.shape}; expected ({n_vertices},)"
+            )
+        return np.ascontiguousarray(d)
+
+
+ENGINE_REGISTRY = {
+    "potpourri": PotpourriDistanceEngine,
+    "potpourri_fmm": PotpourriFmmDistanceEngine,
+    "pycortex": PycortexDistanceEngine,
+    "pygeodesic": PyGeodesicDistanceEngine,
+}
+
+
+def create_distance_engine(engine_type, vertices, faces, engine_kwargs=None):
+    """Construct a distance engine by name."""
+    key = str(engine_type).strip().lower()
+    if key not in ENGINE_REGISTRY:
+        valid = ", ".join(sorted(ENGINE_REGISTRY.keys()))
+        raise ValueError(f"Unknown engine_type '{engine_type}'. Valid options: {valid}")
+    cls = ENGINE_REGISTRY[key]
+    kwargs = dict(engine_kwargs or {})
+    return cls(vertices, faces, **kwargs)

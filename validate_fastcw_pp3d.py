@@ -21,7 +21,7 @@ import nibabel as nib
 import numpy as np
 from scipy.spatial import Delaunay
 
-from fastcw_pp3d import FastCorticalWiringAnalysis
+from core_analysis import FastCorticalWiringAnalysis
 
 
 HEMI = "lh"
@@ -511,7 +511,7 @@ def build_surface_cfg(analysis_objects_by_name):
 
 def validate_surface(base_dir, subject_id, cfg, run_integration=False):
     print(f"\n=== Validating {subject_id} ===")
-    analysis = FastCorticalWiringAnalysis(base_dir, subject_id, hemi=HEMI, surf_type="pial")
+    analysis = FastCorticalWiringAnalysis.from_freesurfer(base_dir, subject_id, hemi=HEMI, surf_type="pial")
     n_vertices = int(analysis.n_vertices)
     if n_vertices < MIN_VERTICES_VALIDATE:
         print(f"SKIP: mesh too small for reliable local discs (nV={n_vertices} < {MIN_VERTICES_VALIDATE})")
@@ -871,7 +871,9 @@ def main():
 
     analysis_objects = {}
     for surface_name in EXPECTED_SUBJECTS:
-        analysis_objects[surface_name] = FastCorticalWiringAnalysis(base_dir, surface_name, hemi=HEMI, surf_type="pial")
+        analysis_objects[surface_name] = FastCorticalWiringAnalysis.from_freesurfer(
+            base_dir, surface_name, hemi=HEMI, surf_type="pial"
+        )
 
     surface_cfg = build_surface_cfg(analysis_objects)
 

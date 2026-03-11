@@ -5,4 +5,7 @@ pandas
 matplotlib
 tqdm
 pycortex
+
+# Optional exact-reference backend:
+# pygeodesic
 numba

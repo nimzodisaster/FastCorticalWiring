@@ -29,12 +29,13 @@ These metrics provide quantitative descriptions of cortical spatial organization
 
 ### High-performance geodesic computation
 
-Uses the **heat method** (Crane et al., 2013) via:
+Uses pluggable geodesic backends:
 
 * `potpourri3d` (primary backend, recommended)
-* `pycortex` (legacy backend)
+* `pygeodesic` (exact discrete-geodesic reference backend)
+* `pycortex` (alternate backend)
 
-The heat method solves geodesic distance to all vertices simultaneously using sparse linear algebra. This is dramatically faster than graph-based methods like Dijkstra’s algorithm for the one-to-all distance computations required here.
+For `potpourri3d` and `pycortex`, the heat method solves geodesic distance to all vertices simultaneously using sparse linear algebra. This is dramatically faster than graph-based methods like Dijkstra’s algorithm for the one-to-all distance computations required here.
 
 Typical speedup over traditional approaches: **10×–100×**
 
@@ -104,16 +105,14 @@ Produces both analysis-ready and visualization-ready outputs:
 ## Repository contents
 
 ```
-fastcw_pp3d.py
-    Primary implementation using potpourri3d heat method
+core_analysis.py
+    Shared cortical wiring pipeline (engine-agnostic)
+
+distance_engines.py
+    Backend adapters (potpourri, pygeodesic, pycortex)
 
 fastcw.py
-    Legacy implementation using pycortex backend
-
-validate_fastcw_pp3d.py
-    Synthetic validation harness with fsaverage-scale meshes
-
-requirements.txt
+    Canonical CLI interface and orchestration (default engine: potpourri)
 ```
 
 ---
@@ -141,10 +140,16 @@ matplotlib
 tqdm
 ```
 
-Optional legacy support:
+Optional pycortex support:
 
 ```
 pycortex
+```
+
+Optional exact-reference backend:
+
+```
+pip install pygeodesic
 ```
 
 For best performance, build potpourri3d locally with SuiteSparse.
@@ -156,7 +161,7 @@ For best performance, build potpourri3d locally with SuiteSparse.
 Primary tool:
 
 ```
-python fastcw_pp3d.py <subjects_dir> <subject_id>
+python fastcw.py <subjects_dir> <subject_id>
 ```
 
 Common options:
@@ -167,6 +172,7 @@ Common options:
 --custom-label cortex
 --scale 0.05
 --area-tol 0.01
+--engine potpourri|pygeodesic|pycortex
 --no-compute-msd
 --overwrite
 --visualize
@@ -175,7 +181,7 @@ Common options:
 Example:
 
 ```
-python fastcw_pp3d.py $SUBJECTS_DIR fsaverage \
+python fastcw.py $SUBJECTS_DIR fsaverage \
   --hemispheres lh rh \
   --scale 0.05
 ```
@@ -319,12 +325,12 @@ Major performance contributors:
 Use:
 
 ```
-fastcw_pp3d.py
+fastcw.py
 ```
 
 This uses potpourri3d with robust heat method solver and is actively maintained.
 
-The pycortex backend remains for compatibility only.
+The default backend is potpourri3d; pycortex and pygeodesic are alternate engines.
 
 ---
 
