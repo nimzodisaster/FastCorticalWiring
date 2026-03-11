@@ -74,10 +74,21 @@ class PotpourriFmmDistanceEngine(BaseDistanceEngine):
         if src < 0 or src >= n_vertices:
             raise ValueError(f"source_idx out of range: {src} for mesh with {n_vertices} vertices")
 
-        d = self._solver.compute_distance(src)
-        d = np.asarray(d, dtype=np.float64)
+        try:
+            # Older potpourri3d API accepted a single vertex index directly.
+            d = self._solver.compute_distance(src)
+        except TypeError:
+            # Newer API expects sources as curve points in barycentric form.
+            # A vertex source is encoded as (vertex_index, []).
+            source_curves = [[(src, [])]]
+            try:
+                d = self._solver.compute_distance(source_curves, [], False)
+            except TypeError:
+                d = self._solver.compute_distance(source_curves, sign=False)
 
-        if d.ndim != 1 or d.shape[0] != n_vertices:
+        d = np.asarray(d, dtype=np.float64).reshape(-1)
+
+        if d.shape[0] != n_vertices:
             raise ValueError(
                 f"potpourri_fmm returned invalid distance shape {d.shape}; expected ({n_vertices},)"
             )

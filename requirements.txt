@@ -2,6 +2,8 @@
 numpy
 nibabel
 tqdm
+# Force source build so potpourri3d can link against system SuiteSparse.
+--no-binary=potpourri3d
 potpourri3d
 numba
 matplotlib

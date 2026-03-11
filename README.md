@@ -6,6 +6,32 @@ High-performance Python tools for computing intrinsic cortical wiring metrics fr
 
 ---
 
+## Important: potpourri3d Build Prerequisites
+
+`potpourri3d` performs best when built against SuiteSparse. Install build prerequisites before installing Python dependencies:
+
+- macOS (Homebrew): `brew install suitesparse`
+- Ubuntu/Debian: `apt-get install cmake libsuitesparse-dev`
+- Windows: SuiteSparse setup is often difficult; use WSL/Linux when possible.
+
+After SuiteSparse/CMake are installed, install `potpourri3d` from source:
+
+```bash
+python -m pip install potpourri3d --no-binary potpourri3d
+```
+
+This source build behavior is also enforced in `requirements.txt`.
+
+To verify the installed wheel is actually linked against SuiteSparse:
+
+```bash
+python verify_potpourri_suitesparse.py
+```
+
+Expected result: `PASS: SuiteSparse linkage detected.`
+
+---
+
 ## Overview
 
 The cerebral cortex is a folded 2-dimensional sheet embedded in 3D. Many biologically meaningful distance measures—such as connection length or wiring cost—must be computed along the surface itself, not through Euclidean space.
@@ -125,9 +151,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Core dependencies:
-
-Runtime:
+Required dependencies:
 
 ```
 numpy
@@ -135,21 +159,10 @@ scipy
 nibabel
 potpourri3d
 numba
-pandas
 matplotlib
 tqdm
-```
-
-Optional pycortex support:
-
-```
 pycortex
-```
-
-Optional exact-reference backend:
-
-```
-pip install pygeodesic
+pygeodesic
 ```
 
 For best performance, build potpourri3d locally with SuiteSparse.
