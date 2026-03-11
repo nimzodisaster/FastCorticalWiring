@@ -5,7 +5,17 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
-from backend_check import verify_suitesparse
+_BACKEND_CHECK_IMPORT_ERROR = None
+try:
+    from backend_check import verify_suitesparse
+except Exception as exc_abs:
+    try:
+        from .backend_check import verify_suitesparse  # type: ignore
+    except Exception as exc_rel:
+        _BACKEND_CHECK_IMPORT_ERROR = (exc_abs, exc_rel)
+
+        def verify_suitesparse() -> bool:
+            return False
 
 
 class BaseDistanceEngine(ABC):
@@ -38,11 +48,20 @@ class PotpourriDistanceEngine(BaseDistanceEngine):
             raise ImportError("potpourri3d is required for the 'potpourri' engine.") from exc
 
         if not allow_eigen_fallback and not verify_suitesparse():
+            import_note = ""
+            if _BACKEND_CHECK_IMPORT_ERROR is not None:
+                import_note = (
+                    "\nBackend checker import failed in this environment.\n"
+                    f"Absolute import error: {_BACKEND_CHECK_IMPORT_ERROR[0]}\n"
+                    f"Relative import error: {_BACKEND_CHECK_IMPORT_ERROR[1]}\n"
+                    "Ensure backend_check.py is present alongside distance_engines.py.\n"
+                )
             raise RuntimeError(
                 "\n"
                 "==================== FASTCW BACKEND CHECK FAILED ====================\n"
                 "potpourri3d does not appear to be compiled with SuiteSparse support.\n"
                 "Running with Eigen fallback can be orders of magnitude slower.\n"
+                f"{import_note}"
                 "\n"
                 "Fix:\n"
                 "  Reinstall with source build:\n"
