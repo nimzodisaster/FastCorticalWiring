@@ -2,20 +2,41 @@
 """Geodesic distance engine adapters for FastCorticalWiring."""
 
 from abc import ABC, abstractmethod
+import importlib
 
 import numpy as np
 
-_BACKEND_CHECK_IMPORT_ERROR = None
-try:
-    from backend_check import verify_suitesparse
-except Exception as exc_abs:
-    try:
-        from .backend_check import verify_suitesparse  # type: ignore
-    except Exception as exc_rel:
-        _BACKEND_CHECK_IMPORT_ERROR = (exc_abs, exc_rel)
+_BACKEND_CHECK_IMPORT_ERRORS = []
 
-        def verify_suitesparse() -> bool:
-            return False
+
+def _resolve_verify_suitesparse():
+    candidates = (
+        "backend_check",
+        ".backend_check",
+    )
+    for mod_name in candidates:
+        try:
+            if mod_name.startswith("."):
+                mod = importlib.import_module(mod_name, package=__package__)
+            else:
+                mod = importlib.import_module(mod_name)
+        except Exception as exc:
+            _BACKEND_CHECK_IMPORT_ERRORS.append((mod_name, exc))
+            continue
+        fn = getattr(mod, "verify_suitesparse", None)
+        if callable(fn):
+            return fn
+        _BACKEND_CHECK_IMPORT_ERRORS.append((mod_name, AttributeError("verify_suitesparse() missing")))
+    return None
+
+
+_VERIFY_SUITESPARSE = _resolve_verify_suitesparse()
+
+
+def verify_suitesparse(**kwargs) -> bool:
+    if _VERIFY_SUITESPARSE is None:
+        return False
+    return bool(_VERIFY_SUITESPARSE(**kwargs))
 
 
 class BaseDistanceEngine(ABC):
@@ -47,21 +68,21 @@ class PotpourriDistanceEngine(BaseDistanceEngine):
         except Exception as exc:
             raise ImportError("potpourri3d is required for the 'potpourri' engine.") from exc
 
-        if not allow_eigen_fallback and not verify_suitesparse():
-            import_note = ""
-            if _BACKEND_CHECK_IMPORT_ERROR is not None:
-                import_note = (
-                    "\nBackend checker import failed in this environment.\n"
-                    f"Absolute import error: {_BACKEND_CHECK_IMPORT_ERROR[0]}\n"
-                    f"Relative import error: {_BACKEND_CHECK_IMPORT_ERROR[1]}\n"
-                    "Ensure backend_check.py is present alongside distance_engines.py.\n"
-                )
+        if not allow_eigen_fallback and _VERIFY_SUITESPARSE is None:
+            lines = ["\nBackend checker could not be imported in this environment."]
+            for mod_name, err in _BACKEND_CHECK_IMPORT_ERRORS:
+                lines.append(f"  - {mod_name}: {err}")
+            lines.append(
+                "Ensure backend_check.py is present and importable alongside distance_engines.py."
+            )
+            raise RuntimeError("\n".join(lines))
+
+        if not allow_eigen_fallback and not verify_suitesparse(verbose=True):
             raise RuntimeError(
                 "\n"
                 "==================== FASTCW BACKEND CHECK FAILED ====================\n"
                 "potpourri3d does not appear to be compiled with SuiteSparse support.\n"
                 "Running with Eigen fallback can be orders of magnitude slower.\n"
-                f"{import_note}"
                 "\n"
                 "Fix:\n"
                 "  Reinstall with source build:\n"

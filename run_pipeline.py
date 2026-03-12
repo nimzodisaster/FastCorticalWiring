@@ -2,6 +2,7 @@
 """Parallel native-space FastCW runner (no resampling)."""
 
 import argparse
+from datetime import datetime, timezone
 import logging
 import os
 import subprocess
@@ -14,6 +15,10 @@ from pathlib import Path
 ENV = {}
 
 
+def _utc_now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def run_cmd(cmd, subject_id, log_file=None, dry_run=False):
     """Execute a command or print it in dry-run mode."""
     if dry_run:
@@ -23,11 +28,20 @@ def run_cmd(cmd, subject_id, log_file=None, dry_run=False):
     try:
         if log_file:
             with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"[{_utc_now_iso()}] START subject={subject_id}\n")
+                f.write(f"[{_utc_now_iso()}] CMD {' '.join(cmd)}\n")
+                f.flush()
                 subprocess.run(cmd, check=True, stdout=f, stderr=subprocess.STDOUT, env=ENV)
+                f.write(f"[{_utc_now_iso()}] FINISH subject={subject_id} status=ok\n")
+                f.flush()
         else:
             subprocess.run(cmd, check=True, capture_output=True, text=True, env=ENV)
         return True
     except subprocess.CalledProcessError as exc:
+        if log_file:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"[{_utc_now_iso()}] FINISH subject={subject_id} status=failed returncode={exc.returncode}\n")
+                f.flush()
         error_msg = exc.stderr if exc.stderr else "Check log file for details."
         logging.error(f"[{subject_id}] Command failed: {' '.join(cmd[:3])}... \nError: {error_msg}")
         return False

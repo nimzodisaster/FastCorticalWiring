@@ -25,7 +25,7 @@ This source build behavior is also enforced in `requirements.txt`.
 To verify the installed wheel is actually linked against SuiteSparse:
 
 ```bash
-python verify_potpourri_suitesparse.py
+python backend_check.py
 ```
 
 Expected result: `PASS: SuiteSparse linkage detected.`
