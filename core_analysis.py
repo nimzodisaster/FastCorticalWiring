@@ -472,6 +472,7 @@ class FastCorticalWiringAnalysis:
                 seen.add(value)
                 normalized.append(value)
 
+        normalized.sort()
         return tuple(normalized)
 
     @staticmethod
@@ -933,6 +934,8 @@ class FastCorticalWiringAnalysis:
         dmin=None,
         dmax=None,
         r_init=None,
+        r_lower=None,
+        r_upper=None,
         delta0=None,
         expand_factor=1.6,
         max_expand=25,
@@ -967,54 +970,80 @@ class FastCorticalWiringAnalysis:
         def area_inside(r):
             return self._area_inside_radius(r, distances_sub, dmin=dmin, dmax=dmax)
 
-        # ---------------------------------------------------------------------
-        # Bracketing
-        # ---------------------------------------------------------------------
-        if r_init is None or not np.isfinite(r_init):
-            # Backward-compatible behavior: conservative global bracket
-            r_min, r_max = 0.0, d_global_max
-        else:
-            # Choose a small initial delta0 if not provided.
-            if delta0 is None or not np.isfinite(delta0) or delta0 <= 0:
-                delta0 = 0.01 * d_global_max
-
-            r_min = max(0.0, float(r_init) - float(delta0))
-            r_max = min(d_global_max, float(r_init) + float(delta0))
-
-            # Ensure non-degenerate
-            if r_max <= r_min + 1e-12:
-                r_min = max(0.0, float(r_init) - 2.0 * float(delta0))
-                r_max = min(d_global_max, float(r_init) + 2.0 * float(delta0))
-
-            # Expand upper bound until area(r_max) >= target_area
-            a_min = area_inside(r_min) if r_min > 0 else 0.0
-            a_max = area_inside(r_max)
-
-            # If r_min already too big (area above target), shrink r_min down toward 0
-            if a_min > target_area:
-                r_min = 0.0
-                a_min = 0.0
-
-            n_expand = 0
-            while a_max + 1e-12 < target_area and r_max < d_global_max and n_expand < max_expand:
-                # Expand upward
-                new_r_max = min(d_global_max, r_max * expand_factor + 1e-12)
-                if new_r_max <= r_max + 1e-12:
-                    break
-                r_max = new_r_max
-                a_max = area_inside(r_max)
-                n_expand += 1
-
-            # If expansion failed to bracket for some reason, fall back to global upper bound
-            if a_max + 1e-12 < target_area:
-                r_min, r_max = 0.0, d_global_max
-
-        # ---------------------------------------------------------------------
-        # Bisection
-        # ---------------------------------------------------------------------
         # If target_area is tiny, return ~0
         if target_area <= 0:
             return 0.0
+
+        def clamp_radius(x):
+            if x is None:
+                return None
+            try:
+                val = float(x)
+            except Exception:
+                return None
+            if not np.isfinite(val):
+                return None
+            return min(d_global_max, max(0.0, val))
+
+        # ---------------------------------------------------------------------
+        # Bracketing
+        # ---------------------------------------------------------------------
+        lower = clamp_radius(r_lower)
+        upper = clamp_radius(r_upper)
+        seed = clamp_radius(r_init)
+
+        # Choose a small initial delta0 if not provided.
+        if delta0 is None or not np.isfinite(delta0) or delta0 <= 0:
+            delta0 = 0.01 * d_global_max
+        delta0 = float(max(delta0, 1e-12))
+
+        if lower is None and upper is None:
+            if seed is None:
+                r_min, r_max = 0.0, d_global_max
+            else:
+                r_min = max(0.0, seed - delta0)
+                r_max = min(d_global_max, seed + delta0)
+        else:
+            r_min = lower if lower is not None else (max(0.0, seed - delta0) if seed is not None else 0.0)
+            r_max = upper if upper is not None else (min(d_global_max, seed + delta0) if seed is not None else d_global_max)
+
+        if r_min > r_max:
+            r_min, r_max = r_max, r_min
+        if r_max <= r_min + 1e-12:
+            if seed is None:
+                seed = 0.5 * (r_min + r_max)
+            r_min = max(0.0, seed - delta0)
+            r_max = min(d_global_max, seed + delta0)
+        if r_max <= r_min + 1e-12:
+            r_min, r_max = 0.0, d_global_max
+
+        a_min = area_inside(r_min) if r_min > 0 else 0.0
+        a_max = area_inside(r_max)
+
+        # Symmetric bracket recovery:
+        # - contract lower bound stepwise if it is already above target
+        # - expand upper bound stepwise if it is below target
+        n_contract = 0
+        while a_min > target_area + 1e-12 and r_min > 0.0 and n_contract < max_expand:
+            new_r_min = max(0.0, r_min / expand_factor)
+            if new_r_min >= r_min - 1e-12:
+                break
+            r_min = new_r_min
+            a_min = area_inside(r_min) if r_min > 0 else 0.0
+            n_contract += 1
+
+        n_expand = 0
+        while a_max + 1e-12 < target_area and r_max < d_global_max and n_expand < max_expand:
+            new_r_max = min(d_global_max, r_max * expand_factor + 1e-12)
+            if new_r_max <= r_max + 1e-12:
+                break
+            r_max = new_r_max
+            a_max = area_inside(r_max)
+            n_expand += 1
+
+        # Final conservative fallback if bracket still does not contain target.
+        if a_min > target_area + 1e-12 or a_max + 1e-12 < target_area:
+            r_min, r_max = 0.0, d_global_max
 
         for _ in range(max_iter):
             r_mid = 0.5 * (r_min + r_max)
@@ -1176,14 +1205,31 @@ class FastCorticalWiringAnalysis:
             np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
             np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
 
+            r_prev_scale = np.nan
             for s in scales:
                 scale_key = float(s)
                 r_sub = r_sub_by_scale[scale_key]
                 solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
+
+                neighbor_lower = None
+                neighbor_upper = None
                 if solved_neighbor_r:
-                    r_init = float(np.median(np.asarray(solved_neighbor_r, dtype=np.float64)))
+                    neighbors = np.asarray(solved_neighbor_r, dtype=np.float64)
+                    neighbor_eps = max(self.eps * 10.0, 1e-6)
+                    neighbor_lower = max(0.0, float(np.min(neighbors)) - neighbor_eps)
+                    neighbor_upper = float(np.max(neighbors)) + neighbor_eps
+                    r_init = 0.5 * (neighbor_lower + neighbor_upper)
                 else:
                     r_init = r_euclid_by_scale[scale_key]
+
+                if np.isfinite(r_prev_scale):
+                    if neighbor_lower is None:
+                        r_lower = float(r_prev_scale)
+                    else:
+                        r_lower = max(neighbor_lower, float(r_prev_scale))
+                else:
+                    r_lower = neighbor_lower
+                r_upper = neighbor_upper
 
                 r = self._find_radius_for_area(
                     d_sub,
@@ -1192,12 +1238,16 @@ class FastCorticalWiringAnalysis:
                     dmin=self._dmin_buf,
                     dmax=self._dmax_buf,
                     r_init=r_init,
+                    r_lower=r_lower,
+                    r_upper=r_upper,
                 )
                 if not np.isfinite(r):
                     r_sub[sub_idx] = np.nan
                     self.radius_function[scale_key][orig_idx] = np.nan
                     self.perimeter_function[scale_key][orig_idx] = np.nan
                     continue
+
+                r_prev_scale = float(r)
 
                 perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
                 r_sub[sub_idx] = np.float32(r)

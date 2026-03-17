@@ -31,6 +31,10 @@ def _dummy_engine_factory(_engine_type, vertices, _faces, _engine_kwargs):
 
 
 class VertexSubsetAnalysisTests(unittest.TestCase):
+    def test_normalize_scales_sorts_ascending(self):
+        scales = FastCorticalWiringAnalysis.normalize_scales([0.05, 0.001, 0.01, 0.005])
+        self.assertEqual(scales, (0.001, 0.005, 0.01, 0.05))
+
     def test_compute_all_wiring_costs_respects_vertex_subset(self):
         vertices = np.array(
             [
@@ -75,6 +79,54 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
             self.assertTrue(np.isnan(analysis.msd[idx]))
             self.assertTrue(np.isnan(analysis.radius_function[scale_key][idx]))
             self.assertTrue(np.isnan(analysis.perimeter_function[scale_key][idx]))
+
+    def test_multiscale_solving_uses_sorted_scales_and_cross_scale_lower_bound(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        cortex_mask = np.array([True, True, True, True], dtype=bool)
+
+        with mock.patch("core_analysis.create_distance_engine", side_effect=_dummy_engine_factory):
+            analysis = FastCorticalWiringAnalysis(
+                vertices,
+                faces,
+                cortex_mask,
+                engine_type="potpourri",
+                eps=1e-6,
+                metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
+            )
+
+        # Keep geometry calls cheap and deterministic for this control-flow test.
+        analysis._perimeter_at_radius = lambda *args, **kwargs: 1.0
+
+        calls = []
+
+        def fake_find_radius(distances_sub, target_area, **kwargs):
+            calls.append({"target_area": float(target_area), "r_lower": kwargs.get("r_lower")})
+            return float(len(calls))
+
+        analysis._find_radius_for_area = fake_find_radius
+
+        analysis.compute_all_wiring_costs(
+            compute_msd=False,
+            scale=[0.2, 0.05, 0.1],
+            area_tol=0.1,
+            vertex_subset=[0],
+        )
+
+        self.assertEqual(len(calls), 3)
+        target_areas = [c["target_area"] for c in calls]
+        self.assertEqual(target_areas, sorted(target_areas))
+        self.assertIsNone(calls[0]["r_lower"])
+        self.assertEqual(calls[1]["r_lower"], 1.0)
+        self.assertEqual(calls[2]["r_lower"], 2.0)
 
 
 class _StubAnalysis:
