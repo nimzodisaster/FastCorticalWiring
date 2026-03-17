@@ -1185,6 +1185,7 @@ class FastCorticalWiringAnalysis:
         _t_radius   = 0.0
         _t_perim    = 0.0
         _n_iters    = 0
+        _n_total    = len(order_sub)
 
         # Single loop over all cortical vertices (BFS order for warm-start locality)
         for sub_idx in tqdm(order_sub, desc="Computing wiring costs"):
@@ -1192,7 +1193,8 @@ class FastCorticalWiringAnalysis:
             # --- Phase 1: Geodesic solve ---
             _t0 = _time.perf_counter()
             d_sub = self._compute_geodesic_distances_from_subvertex(sub_idx)
-            _t_geodesic += _time.perf_counter() - _t0
+            _dt_geodesic = _time.perf_counter() - _t0
+            _t_geodesic += _dt_geodesic
 
             orig_idx = self.sub_to_orig[sub_idx]
 
@@ -1206,7 +1208,8 @@ class FastCorticalWiringAnalysis:
                 else:
                     msd_val = np.nan
                 self.msd[orig_idx] = np.float32(msd_val)
-            _t_msd += _time.perf_counter() - _t0
+            _dt_msd = _time.perf_counter() - _t0
+            _t_msd += _dt_msd
 
             # --- Phase 3: dmin/dmax buffers ---
             _t0 = _time.perf_counter()
@@ -1217,10 +1220,13 @@ class FastCorticalWiringAnalysis:
             np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
             np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
             np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
-            _t_dminmax += _time.perf_counter() - _t0
+            _dt_dminmax = _time.perf_counter() - _t0
+            _t_dminmax += _dt_dminmax
 
             # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
             r_prev_scale = np.nan
+            _dt_radius_iter = 0.0
+            _dt_perim_iter = 0.0
             for s in scales:
                 scale_key = float(s)
                 r_sub = r_sub_by_scale[scale_key]
@@ -1257,7 +1263,9 @@ class FastCorticalWiringAnalysis:
                     r_lower=r_lower,
                     r_upper=r_upper,
                 )
-                _t_radius += _time.perf_counter() - _t0
+                _dt_radius = _time.perf_counter() - _t0
+                _t_radius += _dt_radius
+                _dt_radius_iter += _dt_radius
                 if not np.isfinite(r):
                     r_sub[sub_idx] = np.nan
                     self.radius_function[scale_key][orig_idx] = np.nan
@@ -1268,12 +1276,24 @@ class FastCorticalWiringAnalysis:
 
                 _t0 = _time.perf_counter()
                 perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
-                _t_perim += _time.perf_counter() - _t0
+                _dt_perim = _time.perf_counter() - _t0
+                _t_perim += _dt_perim
+                _dt_perim_iter += _dt_perim
                 r_sub[sub_idx] = np.float32(r)
                 self.radius_function[scale_key][orig_idx] = np.float32(r)
                 self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
 
             _n_iters += 1
+            _dt_total_iter = _dt_geodesic + _dt_msd + _dt_dminmax + _dt_radius_iter + _dt_perim_iter
+            tqdm.write(
+                f"[{_n_iters}/{_n_total}] "
+                f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
+                f"msd={1000.0 * _dt_msd:.2f}ms "
+                f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
+                f"radius={1000.0 * _dt_radius_iter:.2f}ms "
+                f"perim={1000.0 * _dt_perim_iter:.2f}ms "
+                f"total={1000.0 * _dt_total_iter:.2f}ms"
+            )
 
         _t_total = _t_geodesic + _t_msd + _t_dminmax + _t_radius + _t_perim
         if _t_total > 0 and _n_iters > 0:
