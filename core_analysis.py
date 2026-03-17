@@ -1177,34 +1177,49 @@ class FastCorticalWiringAnalysis:
             for s in scales
         }
 
+        import time as _time
+
+        _t_geodesic = 0.0
+        _t_msd      = 0.0
+        _t_dminmax  = 0.0
+        _t_radius   = 0.0
+        _t_perim    = 0.0
+        _n_iters    = 0
+
         # Single loop over all cortical vertices (BFS order for warm-start locality)
         for sub_idx in tqdm(order_sub, desc="Computing wiring costs"):
-            # 1. Compute geodesic distances FROM this vertex ONCE
+
+            # --- Phase 1: Geodesic solve ---
+            _t0 = _time.perf_counter()
             d_sub = self._compute_geodesic_distances_from_subvertex(sub_idx)
+            _t_geodesic += _time.perf_counter() - _t0
+
             orig_idx = self.sub_to_orig[sub_idx]
 
-            # 2. Compute MSD from the distance vector (if requested)
+            # --- Phase 2: MSD ---
+            _t0 = _time.perf_counter()
             if compute_msd:
                 valid = (d_sub > self.eps) & np.isfinite(d_sub)
                 if np.any(valid):
-                    w = self.vertex_areas_sub[valid]      # submesh areas align with d_sub
+                    w = self.vertex_areas_sub[valid]
                     msd_val = float((d_sub[valid] * w).sum() / w.sum())
                 else:
                     msd_val = np.nan
                 self.msd[orig_idx] = np.float32(msd_val)
+            _t_msd += _time.perf_counter() - _t0
 
-            # 3. Compute Local Wiring Costs from the SAME distance vector
-            # Populate per-face min/max distance bounds using reusable buffers.
+            # --- Phase 3: dmin/dmax buffers ---
+            _t0 = _time.perf_counter()
             np.take(d_sub, self._f0, out=self._d0_buf)
             np.take(d_sub, self._f1, out=self._d1_buf)
             np.take(d_sub, self._f2, out=self._d2_buf)
-
             np.minimum(self._d0_buf, self._d1_buf, out=self._dmin_buf)
             np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
-
             np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
             np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
+            _t_dminmax += _time.perf_counter() - _t0
 
+            # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
             r_prev_scale = np.nan
             for s in scales:
                 scale_key = float(s)
@@ -1231,6 +1246,7 @@ class FastCorticalWiringAnalysis:
                     r_lower = neighbor_lower
                 r_upper = neighbor_upper
 
+                _t0 = _time.perf_counter()
                 r = self._find_radius_for_area(
                     d_sub,
                     target_areas[scale_key],
@@ -1241,6 +1257,7 @@ class FastCorticalWiringAnalysis:
                     r_lower=r_lower,
                     r_upper=r_upper,
                 )
+                _t_radius += _time.perf_counter() - _t0
                 if not np.isfinite(r):
                     r_sub[sub_idx] = np.nan
                     self.radius_function[scale_key][orig_idx] = np.nan
@@ -1249,10 +1266,32 @@ class FastCorticalWiringAnalysis:
 
                 r_prev_scale = float(r)
 
+                _t0 = _time.perf_counter()
                 perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
+                _t_perim += _time.perf_counter() - _t0
                 r_sub[sub_idx] = np.float32(r)
                 self.radius_function[scale_key][orig_idx] = np.float32(r)
                 self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
+
+            _n_iters += 1
+
+        _t_total = _t_geodesic + _t_msd + _t_dminmax + _t_radius + _t_perim
+        if _t_total > 0 and _n_iters > 0:
+            _per = lambda t: f"{t:.1f}s ({100.0 * t / _t_total:.1f}%)"
+            _timing_lines = [
+                f"Timing breakdown over {_n_iters} vertices:",
+                f"  geodesic solve : {_per(_t_geodesic)}",
+                f"  MSD            : {_per(_t_msd)}",
+                f"  dmin/dmax      : {_per(_t_dminmax)}",
+                f"  radius bisect  : {_per(_t_radius)}  [{len(scales)} scales]",
+                f"  perimeter      : {_per(_t_perim)}  [{len(scales)} scales]",
+                f"  total          : {_t_total:.1f}s",
+                f"  per vertex     : {1000.0 * _t_total / _n_iters:.2f} ms/vertex",
+                f"  geodesic frac  : {100.0 * _t_geodesic / _t_total:.1f}%",
+                f"  geometry frac  : {100.0 * (_t_msd + _t_dminmax + _t_radius + _t_perim) / _t_total:.1f}%",
+            ]
+            for line in _timing_lines:
+                print(line)
 
         # Print summary statistics at the end
         if compute_msd:
