@@ -80,7 +80,7 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
             self.assertTrue(np.isnan(analysis.radius_function[scale_key][idx]))
             self.assertTrue(np.isnan(analysis.perimeter_function[scale_key][idx]))
 
-    def test_multiscale_solving_uses_sorted_scales_and_cross_scale_lower_bound(self):
+    def test_multiscale_solving_uses_sorted_scales_and_cold_start_bounds(self):
         vertices = np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -124,9 +124,11 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         target_areas = [c["target_area"] for c in calls]
         self.assertEqual(target_areas, sorted(target_areas))
-        self.assertIsNone(calls[0]["r_lower"])
-        self.assertEqual(calls[1]["r_lower"], 1.0)
-        self.assertEqual(calls[2]["r_lower"], 2.0)
+        self.assertIsNotNone(calls[0]["r_lower"])
+        self.assertIsNotNone(calls[1]["r_lower"])
+        self.assertIsNotNone(calls[2]["r_lower"])
+        self.assertLess(calls[0]["r_lower"], calls[1]["r_lower"])
+        self.assertLess(calls[1]["r_lower"], calls[2]["r_lower"])
 
 
 class _StubAnalysis:

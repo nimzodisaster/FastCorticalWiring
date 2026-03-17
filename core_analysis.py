@@ -948,7 +948,7 @@ class FastCorticalWiringAnalysis:
         """
         valid = np.isfinite(distances_sub)
         if not np.any(valid):
-            return np.nan
+            return np.nan, 0
 
         # Precompute per-face min/max distance if not provided (used for fast face rejection)
         if dmin is None or dmax is None:
@@ -959,12 +959,12 @@ class FastCorticalWiringAnalysis:
         # Global maximum reachable distance (used for fallback/upper caps)
         d_global_max = float(np.max(distances_sub[valid]))
         if not np.isfinite(d_global_max) or d_global_max <= 0:
-            return np.nan
+            return np.nan, 0
 
         # Quick feasibility check: even at max radius, can we reach target_area?
         area_at_max = self._area_inside_radius(d_global_max, distances_sub, dmin=dmin, dmax=dmax)
         if area_at_max + 1e-12 < target_area:
-            return np.nan  # target too large for this (sub)mesh / disconnected distances
+            return np.nan, 0  # target too large for this (sub)mesh / disconnected distances
 
         # Helper to compute area (kept local to avoid attribute lookups in tight loops)
         def area_inside(r):
@@ -972,7 +972,7 @@ class FastCorticalWiringAnalysis:
 
         # If target_area is tiny, return ~0
         if target_area <= 0:
-            return 0.0
+            return 0.0, 0
 
         def clamp_radius(x):
             if x is None:
@@ -1045,20 +1045,22 @@ class FastCorticalWiringAnalysis:
         if a_min > target_area + 1e-12 or a_max + 1e-12 < target_area:
             r_min, r_max = 0.0, d_global_max
 
+        _bisection_count = 0
         for _ in range(max_iter):
             r_mid = 0.5 * (r_min + r_max)
             a_mid = area_inside(r_mid)
+            _bisection_count += 1
 
             # Convergence: relative area error
             if abs(a_mid - target_area) / target_area < tol:
-                return r_mid
+                return r_mid, _bisection_count
 
             if a_mid < target_area:
                 r_min = r_mid
             else:
                 r_max = r_mid
 
-        return 0.5 * (r_min + r_max)
+        return 0.5 * (r_min + r_max), _bisection_count
 
     def _build_vertex_adjacency(self):
         """
@@ -1225,8 +1227,10 @@ class FastCorticalWiringAnalysis:
 
             # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
             r_prev_scale = np.nan
+            _is_first_vertex = (_n_iters == 0)
             _dt_radius_iter = 0.0
             _dt_perim_iter = 0.0
+            _bisection_iter_count = 0
             for s in scales:
                 scale_key = float(s)
                 r_sub = r_sub_by_scale[scale_key]
@@ -1253,19 +1257,41 @@ class FastCorticalWiringAnalysis:
                 r_upper = neighbor_upper
 
                 _t0 = _time.perf_counter()
-                r = self._find_radius_for_area(
-                    d_sub,
-                    target_areas[scale_key],
-                    tol=area_tol,
-                    dmin=self._dmin_buf,
-                    dmax=self._dmax_buf,
-                    r_init=r_init,
-                    r_lower=r_lower,
-                    r_upper=r_upper,
-                )
+                if _is_first_vertex:
+                    _cold_r_euclid = r_euclid_by_scale[scale_key]
+                    _cold_delta0 = 0.4 * _cold_r_euclid
+                    _r_out = self._find_radius_for_area(
+                        d_sub,
+                        target_areas[scale_key],
+                        tol=area_tol,
+                        dmin=self._dmin_buf,
+                        dmax=self._dmax_buf,
+                        r_init=_cold_r_euclid,
+                        r_lower=max(0.0, _cold_r_euclid - _cold_delta0),
+                        r_upper=_cold_r_euclid + _cold_delta0,
+                        delta0=_cold_delta0,
+                        max_iter=50,
+                    )
+                else:
+                    _r_out = self._find_radius_for_area(
+                        d_sub,
+                        target_areas[scale_key],
+                        tol=area_tol,
+                        dmin=self._dmin_buf,
+                        dmax=self._dmax_buf,
+                        r_init=r_init,
+                        r_lower=r_lower,
+                        r_upper=r_upper,
+                    )
+                if isinstance(_r_out, tuple):
+                    r, _bcount = _r_out
+                else:
+                    # Compatibility for tests/mocks that still return a scalar radius.
+                    r, _bcount = _r_out, 0
                 _dt_radius = _time.perf_counter() - _t0
                 _t_radius += _dt_radius
                 _dt_radius_iter += _dt_radius
+                _bisection_iter_count += int(_bcount)
                 if not np.isfinite(r):
                     r_sub[sub_idx] = np.nan
                     self.radius_function[scale_key][orig_idx] = np.nan
@@ -1292,6 +1318,7 @@ class FastCorticalWiringAnalysis:
                 f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
                 f"radius={1000.0 * _dt_radius_iter:.2f}ms "
                 f"perim={1000.0 * _dt_perim_iter:.2f}ms "
+                f"bisection_iters={_bisection_iter_count} "
                 f"total={1000.0 * _dt_total_iter:.2f}ms"
             )
 
