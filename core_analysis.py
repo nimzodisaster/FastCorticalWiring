@@ -414,6 +414,20 @@ class FastCorticalWiringAnalysis:
         self.faces = F
         self.distance_engine = create_distance_engine(self.engine_type, V, F, self.engine_kwargs)
         print(f"Geodesic backend: {self.distance_engine.name}")
+
+        # Cache face columns and reusable scratch buffers for per-face distance bounds.
+        self._f0 = np.ascontiguousarray(self.faces[:, 0])
+        self._f1 = np.ascontiguousarray(self.faces[:, 1])
+        self._f2 = np.ascontiguousarray(self.faces[:, 2])
+        self._d0_buf = np.empty(self.n_faces, dtype=np.float64)
+        self._d1_buf = np.empty(self.n_faces, dtype=np.float64)
+        self._d2_buf = np.empty(self.n_faces, dtype=np.float64)
+        self._dmin_buf = np.empty(self.n_faces, dtype=np.float64)
+        self._dmax_buf = np.empty(self.n_faces, dtype=np.float64)
+
+        # Cache submesh adjacency and BFS traversal order for reuse across runs.
+        self._adj = self._build_vertex_adjacency()
+        self._bfs_order, _ = self._bfs_order_all(start=0)
         
         # Precompute face geometry for efficient area/perimeter calculations
         self.face_normals, self.face_areas, self.face_unit_normals, self.face_L = self._precompute_face_geometry(self.vertices, self.faces)
@@ -774,7 +788,7 @@ class FastCorticalWiringAnalysis:
         
         # Candidate face filtering: only process faces that might contribute
         # This eliminates most faces and dramatically speeds up computation
-        cand_idx = np.flatnonzero(dmin <= (r + eps)).astype(np.int32)
+        cand_idx = np.flatnonzero(dmin <= (r + eps)).astype(np.int32, copy=False)
         
         if NUMBA_AVAILABLE:
             # Use optimized JIT kernel
@@ -872,7 +886,7 @@ class FastCorticalWiringAnalysis:
             dmax = df.max(axis=1)
         
         # Band filtering: only faces that intersect the isoline
-        band_idx = np.flatnonzero((dmin <= (r + eps)) & (dmax >= (r - eps))).astype(np.int32)
+        band_idx = np.flatnonzero((dmin <= (r + eps)) & (dmax >= (r - eps))).astype(np.int32, copy=False)
         
         if NUMBA_AVAILABLE:
             return float(_perimeter_at_radius_kernel(V, F, self.face_L, distances_sub, r, eps, band_idx))
@@ -1034,7 +1048,9 @@ class FastCorticalWiringAnalysis:
         """
         BFS traversal order over all components of the submesh graph.
         """
-        adj = self._build_vertex_adjacency()
+        adj = getattr(self, "_adj", None)
+        if adj is None:
+            adj = self._build_vertex_adjacency()
         n = len(adj)
         visited = np.zeros(n, dtype=bool)
         order = []
@@ -1107,7 +1123,8 @@ class FastCorticalWiringAnalysis:
             target_area = target_areas[float(s)]
             print(f"  - {s*100:.2f}%: {target_area:.2f} mm² of {total_area:.2f} mm²")
 
-        order_sub, adj = self._bfs_order_all(start=0)
+        order_sub = list(self._bfs_order)
+        adj = self._adj
         if vertex_subset is not None:
             subset_sub_set = set()
             for raw_idx in vertex_subset:
@@ -1148,10 +1165,16 @@ class FastCorticalWiringAnalysis:
                 self.msd[orig_idx] = np.float32(msd_val)
 
             # 3. Compute Local Wiring Costs from the SAME distance vector
-            # Precompute min/max distances per face for efficiency
-            df = d_sub[self.faces]
-            dmin = df.min(axis=1)
-            dmax = df.max(axis=1)
+            # Populate per-face min/max distance bounds using reusable buffers.
+            np.take(d_sub, self._f0, out=self._d0_buf)
+            np.take(d_sub, self._f1, out=self._d1_buf)
+            np.take(d_sub, self._f2, out=self._d2_buf)
+
+            np.minimum(self._d0_buf, self._d1_buf, out=self._dmin_buf)
+            np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
+
+            np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
+            np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
 
             for s in scales:
                 scale_key = float(s)
@@ -1166,8 +1189,8 @@ class FastCorticalWiringAnalysis:
                     d_sub,
                     target_areas[scale_key],
                     tol=area_tol,
-                    dmin=dmin,
-                    dmax=dmax,
+                    dmin=self._dmin_buf,
+                    dmax=self._dmax_buf,
                     r_init=r_init,
                 )
                 if not np.isfinite(r):
@@ -1176,7 +1199,7 @@ class FastCorticalWiringAnalysis:
                     self.perimeter_function[scale_key][orig_idx] = np.nan
                     continue
 
-                perim = self._perimeter_at_radius(r, d_sub, dmin=dmin, dmax=dmax)
+                perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
                 r_sub[sub_idx] = np.float32(r)
                 self.radius_function[scale_key][orig_idx] = np.float32(r)
                 self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
