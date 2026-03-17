@@ -110,7 +110,9 @@ def build_fastcw_cmd(args, subject):
     if args.output_dir: cmd.extend(["--output-dir", args.output_dir])
     if args.output_format: cmd.extend(["--output-format", args.output_format])
     if args.engine: cmd.extend(["--engine", args.engine])
-    if args.sample_vertices is not None: cmd.extend(["--sample-vertices", str(args.sample_vertices)])
+    if args.sample_frac is not None: cmd.extend(["--sample-frac", str(args.sample_frac)])
+    if args.sample_count is not None: cmd.extend(["--sample-count", str(args.sample_count)])
+    if args.sample_method is not None: cmd.extend(["--sample-method", args.sample_method])
     if args.vertex_list: cmd.extend(["--vertex-list", args.vertex_list])
 
     cmd.extend(["--scale", *[str(s) for s in args.scale], "--area-tol", str(args.area_tol), "--eps", str(args.eps)])
@@ -154,7 +156,15 @@ def main():
     parser.add_argument("--output-format", default=None, help="Optional FastCW output format override")
     parser.add_argument("--engine", default=None, help="Optional FastCW geodesic engine")
     parser.add_argument("--engine-kw", action="append", default=[], help="FastCW engine-specific key=value (repeatable)")
-    parser.add_argument("--sample-vertices", type=int, default=None, help="Subset by FPS sample size")
+    sample_group = parser.add_mutually_exclusive_group()
+    sample_group.add_argument("--sample-frac", type=float, default=None, help="Fraction of cortical vertices to retain")
+    sample_group.add_argument("--sample-count", type=int, default=None, help="Exact count of cortical vertices to retain")
+    parser.add_argument(
+        "--sample-method",
+        choices=["stratified", "random", "fps"],
+        default=None,
+        help="Sampling method (defaults to stratified when sampling is enabled)",
+    )
     parser.add_argument("--vertex-list", default=None, help="Subset by vertex-index list file")
     parser.add_argument("--no-compute-msd", action="store_true", help="Disable MSD computation")
     parser.add_argument("--scale", nargs="+", type=float, default=[0.001, 0.005, 0.01, 0.05], help="One or more scales for local measures")

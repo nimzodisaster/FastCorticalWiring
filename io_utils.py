@@ -385,24 +385,140 @@ def save_results_gifti(output_dir, filename_template, metrics, n_vertices):
 
     return written
 
-def farthest_point_sampling(vertices, k, valid_mask):
-    """Spatially uniform sampling using Euclidean Farthest Point Sampling."""
+def random_vertex_sampling(valid_mask, k, random_state=None):
+    """Uniform random sampling over valid vertices without replacement."""
     valid_indices = np.where(valid_mask)[0]
+    n_valid = int(valid_indices.size)
+    if k >= n_valid:
+        return valid_indices.tolist()
+    rng = np.random.default_rng(random_state)
+    picked = rng.choice(valid_indices, size=int(k), replace=False)
+    return np.asarray(picked, dtype=np.int64).tolist()
+
+
+def stratified_vertex_sampling(vertices, valid_mask, k, n_bins=None, random_state=None):
+    """
+    Lightweight stratification over cortical vertex order.
+
+    This is intentionally cheap and reproducible; cortical order is only a proxy for
+    spatial uniformity and not a geodesic stratifier.
+    """
+    _ = vertices  # Reserved for future upgrades (e.g., coordinate-driven binning).
+    valid_indices = np.where(valid_mask)[0]
+    n_valid = int(valid_indices.size)
+    if k >= n_valid:
+        return valid_indices.tolist()
+
+    k = int(k)
+    if n_bins is None:
+        n_bins = max(8, min(256, int(np.sqrt(k))))
+    n_bins = max(1, min(int(n_bins), n_valid))
+
+    bins = np.array_split(valid_indices, n_bins)
+    bin_sizes = np.array([b.size for b in bins], dtype=np.int64)
+    proportions = (bin_sizes / float(n_valid)) * float(k)
+    alloc = np.floor(proportions).astype(np.int64)
+    alloc = np.minimum(alloc, bin_sizes)
+
+    target_remaining = k - int(np.sum(alloc))
+    if target_remaining > 0:
+        frac = proportions - alloc
+        order = np.argsort(-frac)
+        for idx in order:
+            if target_remaining <= 0:
+                break
+            cap = int(bin_sizes[idx] - alloc[idx])
+            if cap <= 0:
+                continue
+            take = min(cap, target_remaining)
+            alloc[idx] += take
+            target_remaining -= take
+
+    rng = np.random.default_rng(random_state)
+    chosen_parts = []
+    for i, b in enumerate(bins):
+        n_take = int(alloc[i])
+        if n_take <= 0:
+            continue
+        if n_take >= b.size:
+            chosen_parts.append(np.asarray(b, dtype=np.int64))
+        else:
+            chosen_parts.append(np.asarray(rng.choice(b, size=n_take, replace=False), dtype=np.int64))
+
+    if chosen_parts:
+        chosen = np.concatenate(chosen_parts)
+    else:
+        chosen = np.empty(0, dtype=np.int64)
+
+    if chosen.size < k:
+        need = int(k - chosen.size)
+        available = np.setdiff1d(valid_indices, chosen, assume_unique=False)
+        top_up = rng.choice(available, size=need, replace=False)
+        chosen = np.concatenate([chosen, np.asarray(top_up, dtype=np.int64)])
+    elif chosen.size > k:
+        trim_idx = rng.choice(np.arange(chosen.size), size=k, replace=False)
+        chosen = chosen[trim_idx]
+
+    return np.asarray(chosen, dtype=np.int64).tolist()
+
+
+def farthest_point_sampling(vertices, k, valid_mask):
+    """Spatially uniform Euclidean FPS restricted to valid/cortical vertices."""
+    valid_indices = np.where(valid_mask)[0]
+    valid_vertices = vertices[valid_indices]
+
     if k >= len(valid_indices):
         return valid_indices.tolist()
 
-    sampled_indices = np.zeros(k, dtype=int)
-    distances = np.full(vertices.shape[0], np.inf)
-    
-    farthest = valid_indices[0]
-    
-    for i in range(k):
-        sampled_indices[i] = farthest
-        dist = np.sum((vertices - vertices[farthest]) ** 2, axis=1)
+    sampled_local = np.zeros(int(k), dtype=np.int64)
+    distances = np.full(valid_vertices.shape[0], np.inf)
+    farthest_local = 0
+
+    for i in range(int(k)):
+        sampled_local[i] = farthest_local
+        dist = np.sum((valid_vertices - valid_vertices[farthest_local]) ** 2, axis=1)
         distances = np.minimum(distances, dist)
-        
-        masked_distances = distances.copy()
-        masked_distances[~valid_mask] = -1.0
-        farthest = np.argmax(masked_distances)
-        
-    return sampled_indices.tolist()
+        farthest_local = int(np.argmax(distances))
+
+    return valid_indices[sampled_local].tolist()
+
+
+def select_vertex_subset(
+    vertices,
+    cortex_mask,
+    *,
+    sample_frac=None,
+    sample_count=None,
+    sample_method="stratified",
+    random_state=None,
+):
+    """Select cortical vertex subset using method-based dispatch."""
+    valid_indices = np.where(cortex_mask)[0]
+    n_valid = int(valid_indices.size)
+    if n_valid == 0:
+        return []
+
+    if sample_frac is not None and sample_count is not None:
+        raise ValueError("sample_frac and sample_count are mutually exclusive.")
+
+    if sample_count is not None:
+        k = int(sample_count)
+        if k <= 0:
+            raise ValueError("sample_count must be a positive integer.")
+    elif sample_frac is not None:
+        frac = float(sample_frac)
+        if frac <= 0.0 or frac > 1.0:
+            raise ValueError("sample_frac must satisfy 0 < sample_frac <= 1.")
+        k = max(1, int(round(frac * n_valid)))
+    else:
+        return None
+
+    k = min(k, n_valid)
+    method = str(sample_method or "stratified").lower()
+    if method == "stratified":
+        return stratified_vertex_sampling(vertices, cortex_mask, k, random_state=random_state)
+    if method == "random":
+        return random_vertex_sampling(cortex_mask, k, random_state=random_state)
+    if method == "fps":
+        return farthest_point_sampling(vertices, k, cortex_mask)
+    raise ValueError(f"Unknown sample_method: {sample_method}")

@@ -42,15 +42,15 @@ class EngineCliParsingTests(unittest.TestCase):
         text = proc.stdout + proc.stderr
         self.assertIn("invalid choice", text)
 
-    def test_subset_flags_are_mutually_exclusive(self):
+    def test_sample_frac_and_sample_count_are_mutually_exclusive(self):
         proc = subprocess.run(
             [
                 sys.executable,
                 "fastcw.py",
-                "--sample-vertices",
+                "--sample-frac",
+                "0.4",
+                "--sample-count",
                 "100",
-                "--vertex-list",
-                "verts.txt",
                 "subjects_dir",
                 "subject_id",
             ],
@@ -61,6 +61,19 @@ class EngineCliParsingTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         text = proc.stdout + proc.stderr
         self.assertIn("not allowed with argument", text)
+
+    def test_help_lists_new_sampling_flags(self):
+        proc = subprocess.run(
+            [sys.executable, "fastcw.py", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
+        text = proc.stdout + proc.stderr
+        self.assertIn("--sample-frac SAMPLE_FRAC", text)
+        self.assertIn("--sample-count SAMPLE_COUNT", text)
+        self.assertIn("--sample-method {stratified,random,fps}", text)
 
     def test_scale_accepts_single_value(self):
         proc = subprocess.run(

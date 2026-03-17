@@ -7,7 +7,7 @@ import os
 import numpy as np
 
 from core_analysis import FastCorticalWiringAnalysis
-from io_utils import farthest_point_sampling, infer_output_basename
+from io_utils import infer_output_basename, select_vertex_subset
 
 
 def _metric_names_for_scales(scales):
@@ -58,6 +58,17 @@ def _resolve_naming(metadata, output_dir, output_basename=None, suffix=""):
     csv_filename = f"{base}{suffix}_wiring_costs.csv"
     scalar_stem = f"{base}{suffix}.{{metric}}"
     return csv_filename, scalar_stem
+
+
+def _format_sampling_suffix(sample_method, sample_frac=None, sample_count=None):
+    method = str(sample_method).lower()
+    if sample_frac is not None:
+        pct = float(sample_frac) * 100.0
+        pct_token = format(pct, "g").replace(".", "p")
+        return f"_sample-{method}-frac{pct_token}p"
+    if sample_count is not None:
+        return f"_sample-{method}-n{int(sample_count)}"
+    return ""
 
 
 def _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem, metric_names):
@@ -134,7 +145,10 @@ def _run_single_surface(
     area_tol,
     eps,
     overwrite,
-    sample_vertices=None,
+    sample_frac=None,
+    sample_count=None,
+    sample_method=None,
+    sample_vertices=None,  # deprecated alias for sample_count
     vertex_list=None,
 ):
     from io_utils import load_surface_and_mask
@@ -162,11 +176,36 @@ def _run_single_surface(
     scales = FastCorticalWiringAnalysis.normalize_scales(scale)
     metric_names = _metric_names_for_scales(scales)
 
-    suffix = ""
     if sample_vertices is not None:
-        suffix = f"_fps{int(sample_vertices)}"
-    elif vertex_list is not None:
+        if sample_count is not None:
+            raise ValueError("Do not provide both sample_vertices (deprecated) and sample_count.")
+        sample_count = int(sample_vertices)
+
+    if sample_frac is not None and sample_count is not None:
+        raise ValueError("sample_frac and sample_count are mutually exclusive.")
+    if sample_frac is not None:
+        sample_frac = float(sample_frac)
+        if sample_frac <= 0.0 or sample_frac > 1.0:
+            raise ValueError("sample_frac must satisfy 0 < sample_frac <= 1.")
+    if sample_count is not None:
+        sample_count = int(sample_count)
+        if sample_count <= 0:
+            raise ValueError("sample_count must be a positive integer.")
+    if sample_method is not None:
+        sample_method = str(sample_method).lower()
+        if sample_method not in {"stratified", "random", "fps"}:
+            raise ValueError(f"Unknown sample_method: {sample_method}")
+
+    suffix = ""
+    if vertex_list is not None:
         suffix = "_subset"
+    elif sample_frac is not None or sample_count is not None:
+        method = sample_method or "stratified"
+        suffix = _format_sampling_suffix(
+            method,
+            sample_frac=sample_frac,
+            sample_count=sample_count,
+        )
 
     output_kinds = _resolve_output_kinds(output_format, standard)
     csv_filename, scalar_stem = _resolve_naming(
@@ -190,12 +229,31 @@ def _run_single_surface(
             raise FileNotFoundError(f"--vertex-list file not found: {vertex_list}")
         loaded = np.loadtxt(vertex_list, dtype=int)
         vertex_subset = np.atleast_1d(loaded).astype(np.int64).tolist()
-    elif sample_vertices is not None:
-        n_sample = int(sample_vertices)
-        if n_sample <= 0:
-            raise ValueError("--sample-vertices must be a positive integer.")
-        print(f"Applying Farthest Point Sampling for {n_sample} vertices...")
-        vertex_subset = farthest_point_sampling(vertices, n_sample, cortex_mask)
+    elif sample_frac is not None or sample_count is not None:
+        method = sample_method or "stratified"
+        n_cortical = int(np.count_nonzero(cortex_mask))
+        if sample_count is not None:
+            requested_k = int(sample_count)
+            msg_target = f"n={requested_k}"
+        else:
+            requested_k = max(1, int(round(float(sample_frac) * n_cortical)))
+            msg_target = f"frac={sample_frac:g} (~n={requested_k})"
+
+        if requested_k >= n_cortical:
+            print(
+                f"Sampling request ({msg_target}, method={method}) spans all cortical vertices; "
+                "using full cortical set."
+            )
+        else:
+            print(f"Applying {method} sampling on cortical vertices: {msg_target}")
+
+        vertex_subset = select_vertex_subset(
+            vertices,
+            cortex_mask,
+            sample_frac=sample_frac,
+            sample_count=sample_count,
+            sample_method=method,
+        )
 
     analysis = FastCorticalWiringAnalysis(
         vertices,
@@ -234,7 +292,10 @@ def process_subject(
     engine_kwargs=None,
     mask_path=None,
     no_mask=False,
-    sample_vertices=None,
+    sample_frac=None,
+    sample_count=None,
+    sample_method=None,
+    sample_vertices=None,  # deprecated alias
     vertex_list=None,
 ):
     """Positional FreeSurfer workflow compatibility entry point."""
@@ -271,6 +332,9 @@ def process_subject(
             area_tol=area_tol,
             eps=eps,
             overwrite=overwrite,
+            sample_frac=sample_frac,
+            sample_count=sample_count,
+            sample_method=sample_method,
             sample_vertices=sample_vertices,
             vertex_list=vertex_list,
         )
@@ -362,20 +426,45 @@ def run_cli(default_engine="potpourri"):
     )
     parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area binary search")
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
-    subset_group = parser.add_mutually_exclusive_group()
-    subset_group.add_argument(
+    sample_group = parser.add_mutually_exclusive_group()
+    sample_group.add_argument(
+        "--sample-frac",
+        type=float,
+        default=None,
+        help="Fraction of cortical vertices to retain after masking (0 < f <= 1)",
+    )
+    sample_group.add_argument(
+        "--sample-count",
+        type=int,
+        default=None,
+        help="Exact number of cortical vertices to retain after masking",
+    )
+    parser.add_argument(
+        "--sample-method",
+        choices=["stratified", "random", "fps"],
+        default=None,
+        help="Sampling strategy (defaults to stratified when sampling is enabled)",
+    )
+    parser.add_argument(
         "--sample-vertices",
         type=int,
         default=None,
-        help="Spatially uniform sample of N cortical vertices",
+        help=argparse.SUPPRESS,
     )
-    subset_group.add_argument(
+    parser.add_argument(
         "--vertex-list",
         type=str,
         default=None,
-        help="Path to text file with specific vertex indices",
+        help="Path to text file with specific vertex indices (highest-priority subset override)",
     )
     args = parser.parse_args()
+
+    if args.sample_vertices is not None:
+        if args.sample_count is not None:
+            raise ValueError("Do not combine deprecated --sample-vertices with --sample-count.")
+        args.sample_count = int(args.sample_vertices)
+        print("WARNING: --sample-vertices is deprecated; use --sample-count instead.")
+        args.sample_vertices = None
 
     engine_kwargs = parse_engine_kwargs(args.engine_kw)
     if args.allow_eigen_fallback:
@@ -408,6 +497,9 @@ def run_cli(default_engine="potpourri"):
             area_tol=args.area_tol,
             eps=args.eps,
             overwrite=args.overwrite,
+            sample_frac=args.sample_frac,
+            sample_count=args.sample_count,
+            sample_method=args.sample_method,
             sample_vertices=args.sample_vertices,
             vertex_list=args.vertex_list,
         )
@@ -443,6 +535,9 @@ def run_cli(default_engine="potpourri"):
             engine_kwargs=engine_kwargs,
             mask_path=args.mask,
             no_mask=args.no_mask,
+            sample_frac=args.sample_frac,
+            sample_count=args.sample_count,
+            sample_method=args.sample_method,
             sample_vertices=args.sample_vertices,
             vertex_list=args.vertex_list,
         )

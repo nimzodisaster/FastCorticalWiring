@@ -157,7 +157,7 @@ class VertexListLoadingTests(unittest.TestCase):
             "surf_type": "pial",
         }
 
-    def _run_single(self, vertex_list):
+    def _run_single(self, vertex_list, sample_frac=None, sample_count=None, sample_method=None):
         with tempfile.TemporaryDirectory() as tmpdir:
             with mock.patch("io_utils.load_surface_and_mask", return_value=(self.vertices, self.faces, self.cortex_mask, self.metadata)):
                 with mock.patch("fastcw.FastCorticalWiringAnalysis", _StubAnalysis):
@@ -182,7 +182,9 @@ class VertexListLoadingTests(unittest.TestCase):
                             area_tol=0.01,
                             eps=1e-6,
                             overwrite=True,
-                            sample_vertices=None,
+                            sample_frac=sample_frac,
+                            sample_count=sample_count,
+                            sample_method=sample_method,
                             vertex_list=vertex_list,
                         )
 
@@ -211,6 +213,16 @@ class VertexListLoadingTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self._run_single(missing)
 
+    def test_vertex_list_overrides_sampling_settings(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+            tmp.write("1\n")
+            path = tmp.name
+        try:
+            self._run_single(path, sample_frac=0.5, sample_method="random")
+            self.assertEqual(_StubAnalysis.last_compute_kwargs["vertex_subset"], [1])
+        finally:
+            os.unlink(path)
+
 
 class NamingSuffixTests(unittest.TestCase):
     def test_resolve_naming_appends_sampling_suffix(self):
@@ -223,10 +235,10 @@ class NamingSuffixTests(unittest.TestCase):
             metadata,
             output_dir="/tmp",
             output_basename=None,
-            suffix="_fps40962",
+            suffix="_sample-stratified-frac40p",
         )
-        self.assertEqual(csv_filename, "mock_surface_fps40962_wiring_costs.csv")
-        self.assertEqual(scalar_stem, "mock_surface_fps40962.{metric}")
+        self.assertEqual(csv_filename, "mock_surface_sample-stratified-frac40p_wiring_costs.csv")
+        self.assertEqual(scalar_stem, "mock_surface_sample-stratified-frac40p.{metric}")
 
     def test_resolve_naming_appends_subset_suffix(self):
         metadata = {
