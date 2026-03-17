@@ -110,8 +110,10 @@ def build_fastcw_cmd(args, subject):
     if args.output_dir: cmd.extend(["--output-dir", args.output_dir])
     if args.output_format: cmd.extend(["--output-format", args.output_format])
     if args.engine: cmd.extend(["--engine", args.engine])
-    if args.sample_frac is not None: cmd.extend(["--sample-frac", str(args.sample_frac)])
-    if args.sample_count is not None: cmd.extend(["--sample-count", str(args.sample_count)])
+    if args.sample is not None:
+        cmd.extend(["--sample", str(args.sample)])
+        if args.sample_kind is not None:
+            cmd.extend(["--sample-kind", str(args.sample_kind)])
     if args.sample_method is not None: cmd.extend(["--sample-method", args.sample_method])
     if args.vertex_list: cmd.extend(["--vertex-list", args.vertex_list])
 
@@ -156,9 +158,18 @@ def main():
     parser.add_argument("--output-format", default=None, help="Optional FastCW output format override")
     parser.add_argument("--engine", default=None, help="Optional FastCW geodesic engine")
     parser.add_argument("--engine-kw", action="append", default=[], help="FastCW engine-specific key=value (repeatable)")
-    sample_group = parser.add_mutually_exclusive_group()
-    sample_group.add_argument("--sample-frac", type=float, default=None, help="Fraction of cortical vertices to retain")
-    sample_group.add_argument("--sample-count", type=int, default=None, help="Exact count of cortical vertices to retain")
+    parser.add_argument(
+        "--sample",
+        type=float,
+        default=None,
+        help="Primary sampling size control (fraction by default; use --sample-kind count for exact cardinality)",
+    )
+    parser.add_argument(
+        "--sample-kind",
+        choices=["frac", "count"],
+        default="frac",
+        help="Interpretation of --sample (default: frac)",
+    )
     parser.add_argument(
         "--sample-method",
         choices=["stratified", "random", "fps"],

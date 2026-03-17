@@ -145,6 +145,8 @@ def _run_single_surface(
     area_tol,
     eps,
     overwrite,
+    sample=None,
+    sample_kind="frac",
     sample_frac=None,
     sample_count=None,
     sample_method=None,
@@ -176,10 +178,33 @@ def _run_single_surface(
     scales = FastCorticalWiringAnalysis.normalize_scales(scale)
     metric_names = _metric_names_for_scales(scales)
 
-    if sample_vertices is not None:
+    request_mode = None
+    if sample is not None:
+        if sample_frac is not None or sample_count is not None or sample_vertices is not None:
+            raise ValueError("Do not combine sample with sample_frac/sample_count/sample_vertices.")
+        kind = str(sample_kind or "frac").lower()
+        if kind not in {"frac", "count"}:
+            raise ValueError(f"Unknown sample_kind: {sample_kind}")
+        if kind == "frac":
+            sample_frac = float(sample)
+            request_mode = "frac"
+        else:
+            sample_as_float = float(sample)
+            if not np.isfinite(sample_as_float):
+                raise ValueError("sample must be finite.")
+            if abs(sample_as_float - round(sample_as_float)) > 1e-9:
+                raise ValueError("sample-kind=count requires an integer-valued --sample.")
+            sample_count = int(round(sample_as_float))
+            request_mode = "count"
+    elif sample_vertices is not None:
         if sample_count is not None:
             raise ValueError("Do not provide both sample_vertices (deprecated) and sample_count.")
         sample_count = int(sample_vertices)
+        request_mode = "count"
+    elif sample_count is not None:
+        request_mode = "count"
+    elif sample_frac is not None:
+        request_mode = "frac"
 
     if sample_frac is not None and sample_count is not None:
         raise ValueError("sample_frac and sample_count are mutually exclusive.")
@@ -201,10 +226,12 @@ def _run_single_surface(
         suffix = "_subset"
     elif sample_frac is not None or sample_count is not None:
         method = sample_method or "stratified"
+        if request_mode is None:
+            request_mode = "count" if sample_count is not None else "frac"
         suffix = _format_sampling_suffix(
             method,
-            sample_frac=sample_frac,
-            sample_count=sample_count,
+            sample_frac=(sample_frac if request_mode == "frac" else None),
+            sample_count=(sample_count if request_mode == "count" else None),
         )
 
     output_kinds = _resolve_output_kinds(output_format, standard)
@@ -292,6 +319,8 @@ def process_subject(
     engine_kwargs=None,
     mask_path=None,
     no_mask=False,
+    sample=None,
+    sample_kind="frac",
     sample_frac=None,
     sample_count=None,
     sample_method=None,
@@ -332,6 +361,8 @@ def process_subject(
             area_tol=area_tol,
             eps=eps,
             overwrite=overwrite,
+            sample=sample,
+            sample_kind=sample_kind,
             sample_frac=sample_frac,
             sample_count=sample_count,
             sample_method=sample_method,
@@ -426,24 +457,35 @@ def run_cli(default_engine="potpourri"):
     )
     parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area binary search")
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
-    sample_group = parser.add_mutually_exclusive_group()
-    sample_group.add_argument(
-        "--sample-frac",
+    parser.add_argument(
+        "--sample",
         type=float,
         default=None,
-        help="Fraction of cortical vertices to retain after masking (0 < f <= 1)",
+        help="Primary sampling size control. By default this is a cortical fraction (0 < sample <= 1).",
     )
-    sample_group.add_argument(
-        "--sample-count",
-        type=int,
-        default=None,
-        help="Exact number of cortical vertices to retain after masking",
+    parser.add_argument(
+        "--sample-kind",
+        choices=["frac", "count"],
+        default="frac",
+        help="Interpretation of --sample (default: frac). Use count for exact cardinality requests.",
     )
     parser.add_argument(
         "--sample-method",
         choices=["stratified", "random", "fps"],
         default=None,
         help="Sampling strategy (defaults to stratified when sampling is enabled)",
+    )
+    parser.add_argument(
+        "--sample-frac",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--sample-vertices",
@@ -459,12 +501,30 @@ def run_cli(default_engine="potpourri"):
     )
     args = parser.parse_args()
 
+    legacy_flags_used = [args.sample_frac is not None, args.sample_count is not None, args.sample_vertices is not None]
+    if args.sample is not None and any(legacy_flags_used):
+        raise ValueError("Do not combine --sample with legacy sampling flags (--sample-frac/--sample-count/--sample-vertices).")
+
     if args.sample_vertices is not None:
         if args.sample_count is not None:
             raise ValueError("Do not combine deprecated --sample-vertices with --sample-count.")
         args.sample_count = int(args.sample_vertices)
-        print("WARNING: --sample-vertices is deprecated; use --sample-count instead.")
-        args.sample_vertices = None
+        print("WARNING: --sample-vertices is deprecated; use --sample with --sample-kind count (or --sample-count alias).")
+
+    if args.sample_frac is not None and args.sample_count is not None:
+        raise ValueError("Do not combine --sample-frac with --sample-count.")
+    if args.sample_frac is not None:
+        args.sample = float(args.sample_frac)
+        args.sample_kind = "frac"
+        print("WARNING: --sample-frac is deprecated; use --sample with --sample-kind frac.")
+        args.sample_frac = None
+    elif args.sample_count is not None:
+        args.sample = float(args.sample_count)
+        args.sample_kind = "count"
+        print("WARNING: --sample-count alias is deprecated; prefer --sample with --sample-kind count.")
+        args.sample_count = None
+
+    args.sample_vertices = None
 
     engine_kwargs = parse_engine_kwargs(args.engine_kw)
     if args.allow_eigen_fallback:
@@ -497,6 +557,8 @@ def run_cli(default_engine="potpourri"):
             area_tol=args.area_tol,
             eps=args.eps,
             overwrite=args.overwrite,
+            sample=args.sample,
+            sample_kind=args.sample_kind,
             sample_frac=args.sample_frac,
             sample_count=args.sample_count,
             sample_method=args.sample_method,
@@ -535,6 +597,8 @@ def run_cli(default_engine="potpourri"):
             engine_kwargs=engine_kwargs,
             mask_path=args.mask,
             no_mask=args.no_mask,
+            sample=args.sample,
+            sample_kind=args.sample_kind,
             sample_frac=args.sample_frac,
             sample_count=args.sample_count,
             sample_method=args.sample_method,

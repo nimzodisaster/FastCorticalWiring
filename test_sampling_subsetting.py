@@ -183,7 +183,7 @@ class SamplingDispatchTests(unittest.TestCase):
                         )
 
     def test_sampling_happens_after_mask_and_indices_are_cortical(self):
-        self._run_single(sample_frac=0.4, sample_method="stratified", vertex_list=None)
+        self._run_single(sample=0.4, sample_method="stratified", vertex_list=None)
         subset = _StubAnalysis.last_compute_kwargs["vertex_subset"]
         self.assertTrue(all(self.cortex_mask[idx] for idx in subset))
 
@@ -192,7 +192,7 @@ class SamplingDispatchTests(unittest.TestCase):
             tmp.write("2\n9\n")
             path = tmp.name
         try:
-            self._run_single(vertex_list=path, sample_frac=0.4, sample_method="random")
+            self._run_single(vertex_list=path, sample=0.4, sample_method="random")
             self.assertEqual(_StubAnalysis.last_compute_kwargs["vertex_subset"], [2, 9])
         finally:
             import os
@@ -207,7 +207,7 @@ class SamplingDispatchTests(unittest.TestCase):
             return "x.csv", "x.{metric}"
 
         with mock.patch("fastcw._resolve_naming", side_effect=_capture_naming):
-            self._run_single(sample_frac=0.4, sample_method="stratified", vertex_list=None)
+            self._run_single(sample=0.4, sample_method="stratified", vertex_list=None)
         self.assertEqual(captured["suffix"], "_sample-stratified-frac40p")
 
     def test_count_suffix_uses_method_and_count(self):
@@ -218,8 +218,15 @@ class SamplingDispatchTests(unittest.TestCase):
             return "x.csv", "x.{metric}"
 
         with mock.patch("fastcw._resolve_naming", side_effect=_capture_naming):
-            self._run_single(sample_count=5, sample_method="fps", vertex_list=None)
+            self._run_single(sample=5, sample_kind="count", sample_method="fps", vertex_list=None)
         self.assertEqual(captured["suffix"], "_sample-fps-n5")
+
+    def test_sample_defaults_to_fraction_mode(self):
+        self._run_single(sample=0.4, sample_method="stratified", vertex_list=None)
+        subset = _StubAnalysis.last_compute_kwargs["vertex_subset"]
+        n_valid = int(np.count_nonzero(self.cortex_mask))
+        expected = max(1, int(round(0.4 * n_valid)))
+        self.assertEqual(len(subset), expected)
 
     def test_run_single_rejects_frac_and_count_together(self):
         with self.assertRaises(ValueError):
