@@ -1230,7 +1230,7 @@ class FastCorticalWiringAnalysis:
             _is_first_vertex = (_n_iters == 0)
             _dt_radius_iter = 0.0
             _dt_perim_iter = 0.0
-            _bisection_iter_count = 0
+            _bisection_iters_by_scale = []
             for s in scales:
                 scale_key = float(s)
                 r_sub = r_sub_by_scale[scale_key]
@@ -1291,13 +1291,14 @@ class FastCorticalWiringAnalysis:
                 _dt_radius = _time.perf_counter() - _t0
                 _t_radius += _dt_radius
                 _dt_radius_iter += _dt_radius
-                _bisection_iter_count += int(_bcount)
                 if not np.isfinite(r):
+                    _bisection_iters_by_scale.append(0)
                     r_sub[sub_idx] = np.nan
                     self.radius_function[scale_key][orig_idx] = np.nan
                     self.perimeter_function[scale_key][orig_idx] = np.nan
                     continue
 
+                _bisection_iters_by_scale.append(int(_bcount))
                 r_prev_scale = float(r)
 
                 _t0 = _time.perf_counter()
@@ -1318,7 +1319,7 @@ class FastCorticalWiringAnalysis:
                 f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
                 f"radius={1000.0 * _dt_radius_iter:.2f}ms "
                 f"perim={1000.0 * _dt_perim_iter:.2f}ms "
-                f"bisection_iters={_bisection_iter_count} "
+                f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
                 f"total={1000.0 * _dt_total_iter:.2f}ms"
             )
 
