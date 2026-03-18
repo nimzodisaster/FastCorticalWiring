@@ -939,6 +939,8 @@ class FastCorticalWiringAnalysis:
         delta0=None,
         expand_factor=1.6,
         max_expand=25,
+        neighbor_range=None,
+        r_euclid=None,
     ):
         """
         Find geodesic radius r such that area_inside_radius(r) ≈ target_area.
@@ -1032,14 +1034,33 @@ class FastCorticalWiringAnalysis:
             a_min = area_inside(r_min) if r_min > 0 else 0.0
             n_contract += 1
 
+        # Compute adaptive expansion step size.
+        # Use neighbor variability as the primary scale, with a fallback
+        # based on the Euclidean radius estimate when neighbor data is absent.
+        if neighbor_range is not None and neighbor_range > 0.0:
+            _expand_step = neighbor_range * 2.0
+        elif r_euclid is not None and r_euclid > 0.0:
+            _expand_step = 0.05 * r_euclid
+        else:
+            _expand_step = 0.01 * d_global_max
+
+        # Minimum step to avoid getting stuck in flat regions
+        _expand_step = max(_expand_step, 1e-4)
+
         n_expand = 0
         while a_max + 1e-12 < target_area and r_max < d_global_max and n_expand < max_expand:
-            new_r_max = min(d_global_max, r_max * expand_factor + 1e-12)
+            new_r_max = min(d_global_max, r_max + _expand_step)
             if new_r_max <= r_max + 1e-12:
                 break
             r_max = new_r_max
             a_max = area_inside(r_max)
             n_expand += 1
+
+        # Fallback: if additive expansion exhausted max_expand without bracketing,
+        # switch to a single multiplicative jump to global bounds.
+        if a_max + 1e-12 < target_area:
+            r_max = d_global_max
+            a_max = area_inside(r_max)
 
         # Final conservative fallback if bracket still does not contain target.
         if a_min > target_area + 1e-12 or a_max + 1e-12 < target_area:
@@ -1244,8 +1265,10 @@ class FastCorticalWiringAnalysis:
                     neighbor_lower = max(0.0, float(np.min(neighbors)) - neighbor_eps)
                     neighbor_upper = float(np.max(neighbors)) + neighbor_eps
                     r_init = 0.5 * (neighbor_lower + neighbor_upper)
+                    _neighbor_range = float(np.max(neighbors)) - float(np.min(neighbors))
                 else:
                     r_init = r_euclid_by_scale[scale_key]
+                    _neighbor_range = 0.0
 
                 if np.isfinite(r_prev_scale):
                     if neighbor_lower is None:
@@ -1282,6 +1305,8 @@ class FastCorticalWiringAnalysis:
                         r_init=r_init,
                         r_lower=r_lower,
                         r_upper=r_upper,
+                        neighbor_range=_neighbor_range,
+                        r_euclid=r_euclid_by_scale[scale_key],
                     )
                 if isinstance(_r_out, tuple):
                     r, _bcount = _r_out
