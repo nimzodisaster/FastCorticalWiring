@@ -17,50 +17,167 @@ ENV = {}
 
 def _utc_now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def get_numa_balanced_cores(target_workers, force_logical=False):
+    """
+    Prefer one logical CPU per physical core.
+    If target_workers exceeds the number of physical cores, only use sibling
+    hyperthreads when force_logical=True.
+    """
+    sockets_primary = {}
+    sockets_all = {}
 
-def get_numa_balanced_cores(target_workers):
-    """Dynamically queries Linux sysfs to balance workers across physical sockets."""
-    sockets = {}
-    for cpu in range(psutil.cpu_count()):
+    for cpu in range(psutil.cpu_count(logical=True)):
         try:
-            # Skip hyperthreads
             with open(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list', 'r') as f:
-                primary_thread = int(f.read().strip().split(',')[0].split('-')[0])
-            if primary_thread != cpu:
-                continue
-                
-            # Group by physical socket
+                sib_text = f.read().strip()
+
+            # Expand formats like "0,64" or "0-1,64-65"
+            sibs = []
+            for part in sib_text.split(','):
+                if '-' in part:
+                    a, b = map(int, part.split('-'))
+                    sibs.extend(range(a, b + 1))
+                else:
+                    sibs.append(int(part))
+
+            primary_thread = min(sibs)
+
             with open(f'/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id', 'r') as f:
                 socket_id = int(f.read().strip())
-                
-            if socket_id not in sockets:
-                sockets[socket_id] = []
-            sockets[socket_id].append(cpu)
+
+            sockets_all.setdefault(socket_id, []).append(cpu)
+            if cpu == primary_thread:
+                sockets_primary.setdefault(socket_id, []).append(cpu)
+
         except IOError:
             continue
 
+    primary_cores = sum(len(v) for v in sockets_primary.values())
+    logical_cores = sum(len(v) for v in sockets_all.values())
+
+    if target_workers <= primary_cores:
+        candidate_sockets = sockets_primary
+    else:
+        if not force_logical:
+            raise ValueError(
+                f"Requested {target_workers} workers, but only {primary_cores} physical cores "
+                f"available. Re-run with --force-logical to use up to {logical_cores} logical CPUs."
+            )
+        if target_workers > logical_cores:
+            raise ValueError(
+                f"Requested {target_workers} workers, but only {logical_cores} logical CPUs available."
+            )
+        candidate_sockets = sockets_all
+
     assigned_cores = []
-    num_sockets = len(sockets)
+    num_sockets = len(candidate_sockets)
     if num_sockets == 0:
         return list(range(target_workers))
 
-    # 1. Determine exactly how many workers go to each socket
-    workers_per_socket = {sock: 0 for sock in sockets}
+    workers_per_socket = {sock: 0 for sock in candidate_sockets}
     for i in range(target_workers):
-        sock = sorted(sockets.keys())[i % num_sockets]
+        sock = sorted(candidate_sockets.keys())[i % num_sockets]
         workers_per_socket[sock] += 1
 
-    # 2. Extract evenly spaced cores from each socket to spread thermal load
-    for sock in sorted(sockets.keys()):
-        cores = sorted(sockets[sock])
+    for sock in sorted(candidate_sockets.keys()):
+        cores = sorted(candidate_sockets[sock])
         needed = workers_per_socket[sock]
         if needed == 0:
             continue
-        
-        step = max(1, len(cores) // needed)
-        for i in range(needed):
-            assigned_cores.append(cores[i * step])
-            
+
+        if needed > len(cores):
+            raise ValueError(
+                f"Socket {sock}: requested {needed} workers but only {len(cores)} CPUs available."
+            )
+
+        if needed == 1:
+            assigned_cores.append(cores[0])
+        else:
+            step = (len(cores) - 1) / (needed - 1)
+            for i in range(needed):
+                assigned_cores.append(cores[round(i * step)])
+
+    return assigned_cores
+def get_numa_balanced_cores(target_workers, force_logical=False):
+    """
+    Prefer one logical CPU per physical core.
+    If target_workers exceeds the number of physical cores, only use sibling
+    hyperthreads when force_logical=True.
+    """
+    sockets_primary = {}
+    sockets_all = {}
+
+    for cpu in range(psutil.cpu_count(logical=True)):
+        try:
+            with open(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list', 'r') as f:
+                sib_text = f.read().strip()
+
+            # Expand formats like "0,64" or "0-1,64-65"
+            sibs = []
+            for part in sib_text.split(','):
+                if '-' in part:
+                    a, b = map(int, part.split('-'))
+                    sibs.extend(range(a, b + 1))
+                else:
+                    sibs.append(int(part))
+
+            primary_thread = min(sibs)
+
+            with open(f'/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id', 'r') as f:
+                socket_id = int(f.read().strip())
+
+            sockets_all.setdefault(socket_id, []).append(cpu)
+            if cpu == primary_thread:
+                sockets_primary.setdefault(socket_id, []).append(cpu)
+
+        except IOError:
+            continue
+
+    primary_cores = sum(len(v) for v in sockets_primary.values())
+    logical_cores = sum(len(v) for v in sockets_all.values())
+
+    if target_workers <= primary_cores:
+        candidate_sockets = sockets_primary
+    else:
+        if not force_logical:
+            raise ValueError(
+                f"Requested {target_workers} workers, but only {primary_cores} physical cores "
+                f"available. Re-run with --force-logical to use up to {logical_cores} logical CPUs."
+            )
+        if target_workers > logical_cores:
+            raise ValueError(
+                f"Requested {target_workers} workers, but only {logical_cores} logical CPUs available."
+            )
+        candidate_sockets = sockets_all
+
+    assigned_cores = []
+    num_sockets = len(candidate_sockets)
+    if num_sockets == 0:
+        return list(range(target_workers))
+
+    workers_per_socket = {sock: 0 for sock in candidate_sockets}
+    for i in range(target_workers):
+        sock = sorted(candidate_sockets.keys())[i % num_sockets]
+        workers_per_socket[sock] += 1
+
+    for sock in sorted(candidate_sockets.keys()):
+        cores = sorted(candidate_sockets[sock])
+        needed = workers_per_socket[sock]
+        if needed == 0:
+            continue
+
+        if needed > len(cores):
+            raise ValueError(
+                f"Socket {sock}: requested {needed} workers but only {len(cores)} CPUs available."
+            )
+
+        if needed == 1:
+            assigned_cores.append(cores[0])
+        else:
+            step = (len(cores) - 1) / (needed - 1)
+            for i in range(needed):
+                assigned_cores.append(cores[round(i * step)])
+
     return assigned_cores
 
 def run_cmd(cmd, subject_id, core_id, log_file=None, dry_run=False):
@@ -135,12 +252,12 @@ def process_subject(subject, args, core_queue):
 
     cmd = build_fastcw_cmd(args, subject)
     success = run_cmd(cmd, subject, core_id, log_file=log_path, dry_run=args.dry_run)
-    
+
     if success:
         logging.info(f"FINISHED: {subject} (Core {core_id} released)")
     else:
         logging.error(f"FAILED: {subject} (Core {core_id} released)")
-        
+
     core_queue.put(core_id)
 
 def main():
@@ -157,6 +274,10 @@ def main():
     parser.add_argument("--output-dir", default=None, help="Optional output directory")
     parser.add_argument("--output-format", default=None, help="Optional FastCW output format override")
     parser.add_argument("--engine", default=None, help="Optional FastCW geodesic engine")
+    parser.add_argument(
+        "--force-logical",
+        action="store_true",
+        help="Allow use of hyperthreads/logical sibling CPUs when jobs exceed physical cores",)
     parser.add_argument("--engine-kw", action="append", default=[], help="FastCW engine-specific key=value (repeatable)")
     parser.add_argument(
         "--sample",
@@ -212,7 +333,7 @@ def main():
         subjects = [line.strip() for line in f if line.strip()]
 
     # Hardware Setup
-    balanced_cores = get_numa_balanced_cores(args.jobs)
+    balanced_cores = get_numa_balanced_cores(args.jobs, force_logical=args.force_logical)
     core_queue = queue.Queue()
     for core in balanced_cores:
         core_queue.put(core)
