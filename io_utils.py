@@ -365,6 +365,15 @@ def save_results_mgh(output_dir, filename_template, metrics, n_vertices, templat
     """Write scalar overlays in FreeSurfer MGH format."""
     _require_nibabel()
     os.makedirs(output_dir, exist_ok=True)
+    mgh_ns = getattr(getattr(nib, "freesurfer", None), "mghformat", None)
+    MGHHeaderCls = getattr(nib, "MGHHeader", None)
+    MGHImageCls = getattr(nib, "MGHImage", None)
+    if MGHHeaderCls is None and mgh_ns is not None:
+        MGHHeaderCls = getattr(mgh_ns, "MGHHeader", None)
+    if MGHImageCls is None and mgh_ns is not None:
+        MGHImageCls = getattr(mgh_ns, "MGHImage", None)
+    if MGHHeaderCls is None or MGHImageCls is None:
+        raise ImportError("Installed nibabel build does not expose FreeSurfer MGH classes.")
 
     if template_mgz_path and os.path.exists(template_mgz_path):
         template_img = nib.load(template_mgz_path)
@@ -374,7 +383,7 @@ def save_results_mgh(output_dir, filename_template, metrics, n_vertices, templat
         template_affine = np.array(
             [[-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
         )
-        template_header = nib.MGHHeader()
+        template_header = MGHHeaderCls()
         template_header.set_data_shape([int(n_vertices), 1, 1])
 
     written = []
@@ -395,7 +404,7 @@ def save_results_mgh(output_dir, filename_template, metrics, n_vertices, templat
         header.set_data_dtype(np.float32)
 
         out_path = os.path.join(output_dir, filename_template.format(metric=metric_name))
-        nib.save(nib.MGHImage(payload, template_affine, header), out_path)
+        nib.save(MGHImageCls(payload, template_affine, header), out_path)
         written.append(out_path)
 
     return written
