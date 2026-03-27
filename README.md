@@ -36,7 +36,7 @@ Expected result: `PASS: SuiteSparse linkage detected.`
 
 The cerebral cortex is a folded 2-dimensional sheet embedded in 3D. Many biologically meaningful distance measures—such as connection length or wiring cost—must be computed along the surface itself, not through Euclidean space.
 
-This package computes three intrinsic wiring metrics at each cortical vertex:
+This package computes intrinsic wiring metrics at each cortical vertex:
 
 * **Mean Separation Distance (MSD)**
   Area-weighted mean geodesic distance to all other cortical vertices. A global measure of intrinsic wiring cost or spatial isolation.
@@ -46,6 +46,15 @@ This package computes three intrinsic wiring metrics at each cortical vertex:
 
 * **Perimeter Function (Boundary Wiring Cost)**
   The perimeter of the geodesic disc defined by the radius function. Related to the cost of connecting to neighboring cortical territories.
+
+* **Interior-Disk Anisotropy**
+  Area-weighted covariance anisotropy of vertices inside each geodesic disk (`d <= r_scale`) after tangent-plane projection.
+
+* **Global Entropy**
+  Area-weighted Shannon entropy of per-seed geodesic distances, normalized by that seed's MSD.
+
+* **Local Entropy (per scale)**
+  Area-weighted Shannon entropy of distances inside each geodesic disk (`d <= r_scale`), normalized by `r_scale`.
 
 These metrics provide quantitative descriptions of cortical spatial organization and intrinsic wiring constraints.
 
@@ -115,6 +124,7 @@ Automatically restricts computation to cortex label:
 * excludes medial wall
 * reduces computational load
 * matches typical neuroimaging workflows
+* hard-fails if no cortex mask can be resolved (unless `--no-mask` is explicitly set)
 
 ---
 
@@ -122,8 +132,9 @@ Automatically restricts computation to cortex label:
 
 Produces both analysis-ready and visualization-ready outputs:
 
-* CSV tables with per-vertex metrics
+* CSV tables with per-vertex metrics (`msd`, `global_entropy`, and per-scale local measures)
 * FreeSurfer `.mgh` overlays
+* fsLR `.shape.gii` overlays
 * compatible with FreeSurfer, nilearn, PySurfer, etc.
 
 ---
@@ -186,9 +197,10 @@ Common options:
 --scale 0.001 0.005 0.01 0.05
 --area-tol 0.01
 --engine potpourri|pygeodesic|pycortex
---no-compute-msd
 --overwrite
 ```
+
+MSD is always computed (required for global entropy normalization).
 
 Example:
 
@@ -234,14 +246,14 @@ Tests explicitly verify accuracy at realistic 5% surface area patches.
 
 ## Performance
 
-Runtime depends primarily on vertex count and whether MSD is computed.
+Runtime depends primarily on vertex count and number of requested scales.
 
 Typical performance on fsaverage6 (~41k vertices):
 
 | Metric                          | Time                          |
 | ------------------------------- | ----------------------------- |
-| Radius + Perimeter              | seconds–minutes               |
-| MSD (full one-to-all distances) | minutes                       |
+| Radius + Perimeter + Anisotropy + Local Entropy | seconds–minutes   |
+| MSD + Global Entropy                            | minutes            |
 | Full hemisphere                 | practical on workstation CPUs |
 
 Performance scales approximately linearly with number of vertices.
@@ -314,6 +326,50 @@ Larger radius:
 Represents boundary extent between cortical regions.
 
 Related to inter-area connection costs and cortical topology.
+
+---
+
+### Interior-disk anisotropy
+
+Represents directional elongation of the interior geodesic neighborhood.
+
+Near 0:
+
+* isotropic local neighborhoods
+* approximately circular interior point distributions
+
+Higher values:
+
+* elongated local neighborhoods
+* directionally biased intrinsic geometry
+
+---
+
+### Global entropy
+
+Represents diversity of full-surface geodesic distances from each seed vertex after MSD normalization.
+
+Higher values:
+
+* broader, more even normalized distance distributions
+
+Lower values:
+
+* concentrated normalized distance distributions
+
+---
+
+### Local entropy
+
+Represents diversity of distances inside each interior geodesic disk (`d <= r_scale`) after radius normalization.
+
+Higher values:
+
+* more heterogeneous local radial structure
+
+Lower values:
+
+* tighter local distance concentration
 
 ---
 

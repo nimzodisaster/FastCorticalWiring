@@ -11,11 +11,13 @@ from io_utils import infer_output_basename, select_vertex_subset
 
 
 def _metric_names_for_scales(scales):
-    names = ["msd"]
+    names = ["msd", "global_entropy"]
     for scale in scales:
         token = FastCorticalWiringAnalysis.scale_token(scale)
         names.append(f"radius_{token}")
         names.append(f"perimeter_{token}")
+        names.append(f"anisotropy_{token}")
+        names.append(f"local_entropy_{token}")
     return tuple(names)
 
 
@@ -94,8 +96,11 @@ def _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, sca
             csv_filename,
             analysis.cortex_mask_full,
             analysis.msd,
+            analysis.global_entropy,
             analysis.radius_function,
             analysis.perimeter_function,
+            analysis.anisotropy_function,
+            analysis.local_entropy_function,
         )
         written.append(csv_path)
 
@@ -154,6 +159,8 @@ def _run_single_surface(
     vertex_list=None,
 ):
     from io_utils import load_surface_and_mask
+    # Global entropy depends on MSD normalization; keep MSD computation always on.
+    compute_msd = True
 
     vertices, faces, cortex_mask, metadata = load_surface_and_mask(
         standard=standard,
@@ -328,6 +335,8 @@ def process_subject(
     vertex_list=None,
 ):
     """Positional FreeSurfer workflow compatibility entry point."""
+    # Global entropy depends on MSD normalization; keep MSD computation always on.
+    compute_msd = True
     if output_dir is None:
         output_dir = os.path.join(subject_dir, subject_id, "surf")
 
@@ -446,8 +455,13 @@ def run_cli(default_engine="potpourri"):
         help="Custom cortex label name for non-standard FreeSurfer surfaces (e.g., cortex6 for {hemi}.cortex6.label)",
     )
     parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite existing output files")
-    parser.add_argument("--compute-msd", dest="compute_msd", action="store_true", default=True, help="Compute MSDs")
-    parser.add_argument("--no-compute-msd", dest="compute_msd", action="store_false", help="Disable MSD computation")
+    parser.add_argument(
+        "--compute-msd",
+        dest="compute_msd",
+        action="store_true",
+        default=True,
+        help="Compute MSDs (always enabled; flag retained for compatibility)",
+    )
     parser.add_argument(
         "--scale",
         nargs="+",

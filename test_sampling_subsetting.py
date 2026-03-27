@@ -31,9 +31,12 @@ class _StubAnalysis:
         self.cortex_mask_full = np.asarray(cortex_mask, dtype=bool)
         self.n_vertices_full = n
         self.msd = np.full(n, np.nan, dtype=np.float32)
+        self.global_entropy = np.full(n, np.nan, dtype=np.float32)
         self.active_scales = (0.05,)
         self.radius_function = {0.05: np.full(n, np.nan, dtype=np.float32)}
         self.perimeter_function = {0.05: np.full(n, np.nan, dtype=np.float32)}
+        self.anisotropy_function = {0.05: np.full(n, np.nan, dtype=np.float32)}
+        self.local_entropy_function = {0.05: np.full(n, np.nan, dtype=np.float32)}
         self.metadata = {}
 
     def compute_all_wiring_costs(self, **kwargs):
@@ -43,8 +46,11 @@ class _StubAnalysis:
     def get_metric_arrays(self):
         return {
             "msd": self.msd,
+            "global_entropy": self.global_entropy,
             "radius_0.05": self.radius_function[0.05],
             "perimeter_0.05": self.perimeter_function[0.05],
+            "anisotropy_0.05": self.anisotropy_function[0.05],
+            "local_entropy_0.05": self.local_entropy_function[0.05],
         }
 
 

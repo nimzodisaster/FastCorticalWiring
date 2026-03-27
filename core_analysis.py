@@ -431,6 +431,7 @@ class FastCorticalWiringAnalysis:
         
         # Precompute face geometry for efficient area/perimeter calculations
         self.face_normals, self.face_areas, self.face_unit_normals, self.face_L = self._precompute_face_geometry(self.vertices, self.faces)
+        self.vertex_normals_sub = self._compute_vertex_normals(self.vertices, self.faces)
         
         # Compute vertex areas (for normalization and total cortex area)
         self.vertex_areas_sub = self._compute_vertex_areas(self.vertices, self.faces)  # Areas in submesh
@@ -444,6 +445,13 @@ class FastCorticalWiringAnalysis:
             float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
         }
         self.perimeter_function = {
+            float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
+        }
+        self.anisotropy_function = {
+            float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
+        }
+        self.global_entropy = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
+        self.local_entropy_function = {
             float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
         }
 
@@ -678,6 +686,65 @@ class FastCorticalWiringAnalysis:
             vertex_areas[face[2]] += area_contrib
             
         return vertex_areas
+
+    def _compute_vertex_normals(self, V, F):
+        """
+        Compute area-weighted vertex normals from adjacent face normals.
+
+        Degenerate vertices (zero accumulated normal norm) receive [0, 0, 1].
+        """
+        n_vertices = int(V.shape[0])
+        normals = np.zeros((n_vertices, 3), dtype=np.float64)
+        face_normals = self.face_normals
+        for f_idx, face in enumerate(F):
+            n = face_normals[f_idx]
+            normals[face[0]] += n
+            normals[face[1]] += n
+            normals[face[2]] += n
+
+        norms = np.linalg.norm(normals, axis=1)
+        good = norms > 0.0
+        normals[good] /= norms[good][:, None]
+        normals[~good] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return normals
+
+    def _tangent_frame_at_subvertex(self, sub_idx):
+        """Return an orthonormal tangent frame (e1, e2, n) at a submesh vertex."""
+        n = np.asarray(self.vertex_normals_sub[int(sub_idx)], dtype=np.float64)
+        n_norm = float(np.linalg.norm(n))
+        if not np.isfinite(n_norm) or n_norm <= 0.0:
+            n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            n = n / n_norm
+
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(float(np.dot(ref, n))) > 0.95:
+            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+        e1 = np.cross(n, ref)
+        e1_norm = float(np.linalg.norm(e1))
+        if e1_norm <= 0.0 or not np.isfinite(e1_norm):
+            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            e1 = np.cross(n, ref)
+            e1_norm = float(np.linalg.norm(e1))
+        if e1_norm <= 0.0 or not np.isfinite(e1_norm):
+            return (
+                np.array([1.0, 0.0, 0.0], dtype=np.float64),
+                np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            )
+
+        e1 = e1 / e1_norm
+        e2 = np.cross(n, e1)
+        e2_norm = float(np.linalg.norm(e2))
+        if e2_norm <= 0.0 or not np.isfinite(e2_norm):
+            return (
+                np.array([1.0, 0.0, 0.0], dtype=np.float64),
+                np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            )
+        e2 = e2 / e2_norm
+        return e1, e2, n
 
     # ========================================================================
     # GEODESIC DISTANCE COMPUTATION
@@ -925,6 +992,230 @@ class FastCorticalWiringAnalysis:
                         perim += float(best_d)
         return float(perim)
 
+    def _collect_isoline_segments(self, radius, distances_sub, dmin=None, dmax=None):
+        """
+        Collect midpoint + length of each contour segment crossing the radius isoline.
+        """
+        r = float(radius)
+        eps = self.eps
+        V, F = self.vertices, self.faces
+
+        if dmin is None or dmax is None:
+            df = distances_sub[F]
+            dmin = df.min(axis=1)
+            dmax = df.max(axis=1)
+
+        band_idx = np.flatnonzero((dmin <= (r + eps)) & (dmax >= (r - eps))).astype(np.int32, copy=False)
+        mids = []
+        lens = []
+
+        for f_idx in band_idx:
+            face = F[f_idx]
+            d = distances_sub[face]
+            if not np.all(np.isfinite(d)):
+                continue
+
+            v_face = V[face]
+            P = self._edge_intersections(r, d, v_face, f_idx)
+            if len(P) == 2:
+                p0 = np.asarray(P[0], dtype=np.float64)
+                p1 = np.asarray(P[1], dtype=np.float64)
+                seg_len = float(np.linalg.norm(p1 - p0))
+                mids.append(0.5 * (p0 + p1))
+                lens.append(seg_len)
+            elif len(P) > 2:
+                used = [False] * len(P)
+                for i in range(len(P)):
+                    if used[i]:
+                        continue
+                    best_j = -1
+                    best_d = 1e30
+                    for j in range(i + 1, len(P)):
+                        if used[j]:
+                            continue
+                        dd = float(np.linalg.norm(P[j] - P[i]))
+                        if dd < best_d:
+                            best_d = dd
+                            best_j = j
+                    if best_j >= 0:
+                        used[i] = used[best_j] = True
+                        p0 = np.asarray(P[i], dtype=np.float64)
+                        p1 = np.asarray(P[best_j], dtype=np.float64)
+                        mids.append(0.5 * (p0 + p1))
+                        lens.append(float(best_d))
+
+        if not mids:
+            return np.empty((0, 3), dtype=np.float64), np.empty((0,), dtype=np.float64)
+        return np.asarray(mids, dtype=np.float64), np.asarray(lens, dtype=np.float64)
+
+    def _circle_anisotropy_at_radius(self, source_sub_idx, radius, distances_sub, dmin=None, dmax=None):
+        """
+        Compute scalar anisotropy from weighted 2D covariance of contour-segment midpoints.
+        """
+        mids, lens = self._collect_isoline_segments(radius, distances_sub, dmin=dmin, dmax=dmax)
+        if mids.shape[0] < 2:
+            return np.nan
+
+        w = np.asarray(lens, dtype=np.float64)
+        wsum = float(np.sum(w))
+        if not np.isfinite(wsum) or wsum <= 0.0:
+            return np.nan
+
+        seed = np.asarray(self.vertices[int(source_sub_idx)], dtype=np.float64)
+        disp = mids - seed[None, :]
+        e1, e2, _ = self._tangent_frame_at_subvertex(source_sub_idx)
+        x = disp @ e1
+        y = disp @ e2
+
+        cx = float(np.sum(w * x) / wsum)
+        cy = float(np.sum(w * y) / wsum)
+        dx = x - cx
+        dy = y - cy
+
+        cxx = float(np.sum(w * dx * dx) / wsum)
+        cxy = float(np.sum(w * dx * dy) / wsum)
+        cyy = float(np.sum(w * dy * dy) / wsum)
+        cov = np.array([[cxx, cxy], [cxy, cyy]], dtype=np.float64)
+
+        try:
+            evals = np.linalg.eigvalsh(cov)
+        except np.linalg.LinAlgError:
+            return np.nan
+        if evals.size != 2 or not np.all(np.isfinite(evals)):
+            return np.nan
+
+        lam1 = float(evals[1])
+        lam2 = float(evals[0])
+        if lam1 < 0.0:
+            lam1 = 0.0
+        if lam2 < 0.0:
+            lam2 = 0.0
+
+        trace2 = lam1 + lam2
+        tiny = np.finfo(np.float64).eps * 10.0
+        if trace2 <= tiny:
+            return 0.0
+        anis = (lam1 - lam2) / trace2
+        return float(np.clip(anis, 0.0, 1.0))
+
+    def _disk_anisotropy_from_vertices(self, source_sub_idx, distances_sub, radius):
+        """
+        Compute anisotropy from area-weighted 2D covariance of all vertices inside d <= r.
+        """
+        r = float(radius)
+        if not np.isfinite(r) or r <= 0.0:
+            return np.nan
+
+        d = np.asarray(distances_sub, dtype=np.float64)
+        mask = np.isfinite(d) & (d <= (r + self.eps))
+        if int(np.sum(mask)) < 10:
+            return np.nan
+
+        w = np.asarray(self.vertex_areas_sub[mask], dtype=np.float64)
+        wsum = float(np.sum(w))
+        if not np.isfinite(wsum) or wsum <= np.finfo(np.float64).eps:
+            return np.nan
+
+        seed = np.asarray(self.vertices[int(source_sub_idx)], dtype=np.float64)
+        disp = np.asarray(self.vertices[mask], dtype=np.float64) - seed[None, :]
+
+        e1, e2, _ = self._tangent_frame_at_subvertex(source_sub_idx)
+        x = disp @ e1
+        y = disp @ e2
+
+        cx = float(np.sum(w * x) / wsum)
+        cy = float(np.sum(w * y) / wsum)
+        dx = x - cx
+        dy = y - cy
+
+        cxx = float(np.sum(w * dx * dx) / wsum)
+        cxy = float(np.sum(w * dx * dy) / wsum)
+        cyy = float(np.sum(w * dy * dy) / wsum)
+        cov = np.array([[cxx, cxy], [cxy, cyy]], dtype=np.float64)
+
+        try:
+            evals = np.linalg.eigh(cov)[0]
+        except np.linalg.LinAlgError:
+            return np.nan
+        if evals.size != 2 or not np.all(np.isfinite(evals)):
+            return np.nan
+
+        lam2 = float(max(evals[0], 0.0))
+        lam1 = float(max(evals[1], 0.0))
+        denom = lam1 + lam2
+        if denom <= np.finfo(np.float64).eps * 10.0:
+            return 0.0
+        anis = (lam1 - lam2) / denom
+        return float(np.clip(anis, 0.0, 1.0))
+
+    def _weighted_entropy_from_normalized_distances(self, d_norm, weights, n_bins=48, lo=0.0, hi=3.0):
+        """
+        Area-weighted Shannon entropy from normalized distances with fixed clipping bins.
+        """
+        x = np.asarray(d_norm, dtype=np.float64)
+        w = np.asarray(weights, dtype=np.float64)
+        if x.ndim != 1 or w.ndim != 1 or x.shape[0] != w.shape[0] or x.size == 0:
+            return np.nan
+
+        finite = np.isfinite(x) & np.isfinite(w) & (w > 0.0)
+        if not np.any(finite):
+            return np.nan
+        x = x[finite]
+        w = w[finite]
+        wsum = float(np.sum(w))
+        if not np.isfinite(wsum) or wsum <= 0.0:
+            return np.nan
+
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo or int(n_bins) <= 0:
+            return np.nan
+        n_bins = int(n_bins)
+        x_clip = np.clip(x, lo, hi)
+        span = hi - lo
+        # Map hi exactly into last bin.
+        frac = (x_clip - lo) / span
+        idx = np.floor(frac * n_bins).astype(np.int64)
+        idx = np.clip(idx, 0, n_bins - 1)
+        hist = np.bincount(idx, weights=w, minlength=n_bins).astype(np.float64, copy=False)
+
+        total = float(np.sum(hist))
+        if not np.isfinite(total) or total <= 0.0:
+            return np.nan
+        p = hist / total
+        p = p[p > 0.0]
+        if p.size == 0:
+            return np.nan
+        return float(-np.sum(p * np.log(p)))
+
+    def _global_entropy_from_distances(self, distances_sub, msd_val):
+        """
+        Global entropy over all cortical vertices, using d_norm = d / MSD(seed).
+        """
+        msd = float(msd_val)
+        if not np.isfinite(msd) or msd <= 0.0:
+            return np.nan
+        d = np.asarray(distances_sub, dtype=np.float64)
+        valid = np.isfinite(d)
+        if not np.any(valid):
+            return np.nan
+        d_norm = d[valid] / msd
+        w = self.vertex_areas_sub[valid]
+        return self._weighted_entropy_from_normalized_distances(d_norm, w, n_bins=48, lo=0.0, hi=3.0)
+
+    def _local_entropy_from_distances(self, distances_sub, radius):
+        """
+        Local entropy inside the geodesic disk d <= r, using d_norm = d / r.
+        """
+        r = float(radius)
+        if not np.isfinite(r) or r <= 0.0:
+            return np.nan
+        d = np.asarray(distances_sub, dtype=np.float64)
+        interior = np.isfinite(d) & (d <= (r + self.eps))
+        if not np.any(interior):
+            return np.nan
+        d_norm = d[interior] / r
+        w = self.vertex_areas_sub[interior]
+        return self._weighted_entropy_from_normalized_distances(d_norm, w, n_bins=48, lo=0.0, hi=3.0)
+
     def _find_radius_for_area(
         self,
         distances_sub,
@@ -1138,15 +1429,15 @@ class FastCorticalWiringAnalysis:
 
     def compute_all_wiring_costs(self, compute_msd=True, scale=None, area_tol=0.01, vertex_subset=None):
         """
-        Compute all wiring cost metrics (MSD, radius, perimeter) in a single pass.
+        Compute all wiring cost metrics (MSD, radius, perimeter, anisotropy, entropy) in a single pass.
 
         This optimized method iterates through each cortical vertex only once. In each
         iteration, it computes the geodesic distance vector and then calculates all
-        derived metrics (MSD, radius, perimeter) from that vector before discarding it.
+        derived metrics (MSD, radius, perimeter, anisotropy, entropy) from that vector before discarding it.
         This avoids re-computing the expensive geodesic distances in separate loops.
 
         Args:
-            compute_msd (bool): If True, compute Mean Separation Distance.
+            compute_msd (bool): Deprecated and ignored; MSD is always computed.
             scale: Single scale or iterable of scales as proportions of total cortical area.
             area_tol (float): Relative tolerance for the area binary search.
             vertex_subset: Optional iterable of original vertex indices to compute.
@@ -1154,18 +1445,21 @@ class FastCorticalWiringAnalysis:
         scales = self.normalize_scales(scale)
         self.active_scales = scales
         self.msd[:] = np.nan
+        self.global_entropy[:] = np.nan
         self.radius_function = {
             float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
         }
         self.perimeter_function = {
             float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
         }
+        self.anisotropy_function = {
+            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
+        }
+        self.local_entropy_function = {
+            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
+        }
 
-        if compute_msd:
-            print("Computing Mean Separation Distances and Local Wiring Costs...")
-        else:
-            scale_desc = ", ".join(f"{s*100:.2f}%" for s in scales)
-            print(f"Computing Local Wiring Costs at scales {scale_desc}...")
+        print("Computing Mean Separation Distances and Local Wiring Costs...")
 
         # Calculate target area once for local measures
         total_area = float(np.sum(self.vertex_areas_sub))
@@ -1207,6 +1501,9 @@ class FastCorticalWiringAnalysis:
         _t_dminmax  = 0.0
         _t_radius   = 0.0
         _t_perim    = 0.0
+        _t_anis     = 0.0
+        _t_entropy_g = 0.0
+        _t_entropy_l = 0.0
         _n_iters    = 0
         _n_total    = len(order_sub)
 
@@ -1223,16 +1520,26 @@ class FastCorticalWiringAnalysis:
 
             # --- Phase 2: MSD ---
             _t0 = _time.perf_counter()
-            if compute_msd:
-                valid = (d_sub > self.eps) & np.isfinite(d_sub)
-                if np.any(valid):
-                    w = self.vertex_areas_sub[valid]
-                    msd_val = float((d_sub[valid] * w).sum() / w.sum())
+            valid = (d_sub > self.eps) & np.isfinite(d_sub)
+            if np.any(valid):
+                w = self.vertex_areas_sub[valid]
+                wsum = float(np.sum(w))
+                if np.isfinite(wsum) and wsum > 0.0:
+                    msd_val = float((d_sub[valid] * w).sum() / wsum)
                 else:
                     msd_val = np.nan
-                self.msd[orig_idx] = np.float32(msd_val)
+            else:
+                msd_val = np.nan
+            self.msd[orig_idx] = np.float32(msd_val)
             _dt_msd = _time.perf_counter() - _t0
             _t_msd += _dt_msd
+
+            # --- Phase 2b: global entropy from all distances normalized by MSD ---
+            _t0 = _time.perf_counter()
+            global_entropy_val = self._global_entropy_from_distances(d_sub, msd_val)
+            self.global_entropy[orig_idx] = np.float32(global_entropy_val)
+            _dt_entropy_g = _time.perf_counter() - _t0
+            _t_entropy_g += _dt_entropy_g
 
             # --- Phase 3: dmin/dmax buffers ---
             _t0 = _time.perf_counter()
@@ -1251,6 +1558,8 @@ class FastCorticalWiringAnalysis:
             _is_first_vertex = (_n_iters == 0)
             _dt_radius_iter = 0.0
             _dt_perim_iter = 0.0
+            _dt_anis_iter = 0.0
+            _dt_entropy_l_iter = 0.0
             _bisection_iters_by_scale = []
             for s in scales:
                 scale_key = float(s)
@@ -1321,6 +1630,8 @@ class FastCorticalWiringAnalysis:
                     r_sub[sub_idx] = np.nan
                     self.radius_function[scale_key][orig_idx] = np.nan
                     self.perimeter_function[scale_key][orig_idx] = np.nan
+                    self.anisotropy_function[scale_key][orig_idx] = np.nan
+                    self.local_entropy_function[scale_key][orig_idx] = np.nan
                     continue
 
                 _bisection_iters_by_scale.append(int(_bcount))
@@ -1331,51 +1642,87 @@ class FastCorticalWiringAnalysis:
                 _dt_perim = _time.perf_counter() - _t0
                 _t_perim += _dt_perim
                 _dt_perim_iter += _dt_perim
+
+                _t0 = _time.perf_counter()
+                anis = self._disk_anisotropy_from_vertices(sub_idx, d_sub, r)
+                _dt_anis = _time.perf_counter() - _t0
+                _t_anis += _dt_anis
+                _dt_anis_iter += _dt_anis
+
+                _t0 = _time.perf_counter()
+                local_entropy = self._local_entropy_from_distances(d_sub, r)
+                _dt_entropy_l = _time.perf_counter() - _t0
+                _t_entropy_l += _dt_entropy_l
+                _dt_entropy_l_iter += _dt_entropy_l
                 r_sub[sub_idx] = np.float32(r)
                 self.radius_function[scale_key][orig_idx] = np.float32(r)
                 self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
+                self.anisotropy_function[scale_key][orig_idx] = np.float32(anis)
+                self.local_entropy_function[scale_key][orig_idx] = np.float32(local_entropy)
 
             _n_iters += 1
-            _dt_total_iter = _dt_geodesic + _dt_msd + _dt_dminmax + _dt_radius_iter + _dt_perim_iter
+            _dt_total_iter = (
+                _dt_geodesic
+                + _dt_msd
+                + _dt_entropy_g
+                + _dt_dminmax
+                + _dt_radius_iter
+                + _dt_perim_iter
+                + _dt_anis_iter
+                + _dt_entropy_l_iter
+            )
             tqdm.write(
                 f"[{_n_iters}/{_n_total}] "
                 f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
                 f"msd={1000.0 * _dt_msd:.2f}ms "
+                f"global_entropy={1000.0 * _dt_entropy_g:.2f}ms "
                 f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
                 f"radius={1000.0 * _dt_radius_iter:.2f}ms "
                 f"perim={1000.0 * _dt_perim_iter:.2f}ms "
+                f"anis={1000.0 * _dt_anis_iter:.2f}ms "
+                f"local_entropy={1000.0 * _dt_entropy_l_iter:.2f}ms "
                 f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
                 f"total={1000.0 * _dt_total_iter:.2f}ms"
             )
 
-        _t_total = _t_geodesic + _t_msd + _t_dminmax + _t_radius + _t_perim
+        _t_total = _t_geodesic + _t_msd + _t_entropy_g + _t_dminmax + _t_radius + _t_perim + _t_anis + _t_entropy_l
         if _t_total > 0 and _n_iters > 0:
             _per = lambda t: f"{t:.1f}s ({100.0 * t / _t_total:.1f}%)"
             _timing_lines = [
                 f"Timing breakdown over {_n_iters} vertices:",
                 f"  geodesic solve : {_per(_t_geodesic)}",
                 f"  MSD            : {_per(_t_msd)}",
+                f"  global entropy : {_per(_t_entropy_g)}",
                 f"  dmin/dmax      : {_per(_t_dminmax)}",
                 f"  radius bisect  : {_per(_t_radius)}  [{len(scales)} scales]",
                 f"  perimeter      : {_per(_t_perim)}  [{len(scales)} scales]",
+                f"  anisotropy     : {_per(_t_anis)}  [{len(scales)} scales]",
+                f"  local entropy  : {_per(_t_entropy_l)}  [{len(scales)} scales]",
                 f"  total          : {_t_total:.1f}s",
                 f"  per vertex     : {1000.0 * _t_total / _n_iters:.2f} ms/vertex",
                 f"  geodesic frac  : {100.0 * _t_geodesic / _t_total:.1f}%",
-                f"  geometry frac  : {100.0 * (_t_msd + _t_dminmax + _t_radius + _t_perim) / _t_total:.1f}%",
+                f"  geometry frac  : {100.0 * (_t_msd + _t_entropy_g + _t_dminmax + _t_radius + _t_perim + _t_anis + _t_entropy_l) / _t_total:.1f}%",
             ]
             for line in _timing_lines:
                 print(line)
 
         # Print summary statistics at the end
-        if compute_msd:
-            valid_msd = self.msd[np.isfinite(self.msd)]
-            if valid_msd.size:
-                print(f"MSD stats: min={np.min(valid_msd):.2f}, max={np.max(valid_msd):.2f}, mean={np.mean(valid_msd):.2f}")
+        valid_msd = self.msd[np.isfinite(self.msd)]
+        if valid_msd.size:
+            print(f"MSD stats: min={np.min(valid_msd):.2f}, max={np.max(valid_msd):.2f}, mean={np.mean(valid_msd):.2f}")
+        vge = self.global_entropy[np.isfinite(self.global_entropy)]
+        if vge.size:
+            print(
+                f"Global entropy stats: "
+                f"min={np.min(vge):.3f}, max={np.max(vge):.3f}, mean={np.mean(vge):.3f}"
+            )
 
         for s in scales:
             scale_key = float(s)
             vr = self.radius_function[scale_key][np.isfinite(self.radius_function[scale_key])]
             vp = self.perimeter_function[scale_key][np.isfinite(self.perimeter_function[scale_key])]
+            va = self.anisotropy_function[scale_key][np.isfinite(self.anisotropy_function[scale_key])]
+            vle = self.local_entropy_function[scale_key][np.isfinite(self.local_entropy_function[scale_key])]
             if vr.size:
                 print(
                     f"Radius stats @ {s*100:.2f}%: "
@@ -1386,6 +1733,16 @@ class FastCorticalWiringAnalysis:
                     f"Perimeter stats @ {s*100:.2f}%: "
                     f"min={np.min(vp):.2f}, max={np.max(vp):.2f}, mean={np.mean(vp):.2f}"
                 )
+            if va.size:
+                print(
+                    f"Anisotropy stats @ {s*100:.2f}%: "
+                    f"min={np.min(va):.3f}, max={np.max(va):.3f}, mean={np.mean(va):.3f}"
+                )
+            if vle.size:
+                print(
+                    f"Local entropy stats @ {s*100:.2f}%: "
+                    f"min={np.min(vle):.3f}, max={np.max(vle):.3f}, mean={np.mean(vle):.3f}"
+                )
 
         return self.msd, self.radius_function, self.perimeter_function
             
@@ -1395,10 +1752,12 @@ class FastCorticalWiringAnalysis:
     
     def get_metric_arrays(self):
         """Return computed metric arrays in a standard mapping."""
-        out = {"msd": self.msd}
+        out = {"msd": self.msd, "global_entropy": self.global_entropy}
         for scale in self.active_scales:
             scale_key = float(scale)
             token = self.scale_token(scale_key)
             out[f"radius_{token}"] = self.radius_function[scale_key]
             out[f"perimeter_{token}"] = self.perimeter_function[scale_key]
+            out[f"anisotropy_{token}"] = self.anisotropy_function[scale_key]
+            out[f"local_entropy_{token}"] = self.local_entropy_function[scale_key]
         return out

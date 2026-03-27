@@ -244,9 +244,10 @@ def load_surface_and_mask(
                         metadata["mask_source"] = f"aparc_fallback:{candidate}"
 
             if cortex_mask is None:
-                warnings.warn("No cortex mask found; falling back to all vertices.", RuntimeWarning)
-                cortex_mask = np.ones(n_vertices, dtype=bool)
-                metadata["mask_source"] = "all_vertices_fallback"
+                raise FileNotFoundError(
+                    "No cortical mask found for FreeSurfer surface. "
+                    "Provide --mask, use --custom-label if applicable, or pass --no-mask explicitly."
+                )
 
         if subject_dir and subject_id:
             mgh_template = os.path.join(subject_dir, subject_id, "mri", "orig.mgz")
@@ -279,7 +280,17 @@ def load_surface_and_mask(
     raise ValueError(f"Unsupported standard '{standard}'. Expected 'freesurfer' or 'fslr'.")
 
 
-def save_results_csv(output_dir, csv_filename, cortex_mask, msd, radius_function, perimeter_function):
+def save_results_csv(
+    output_dir,
+    csv_filename,
+    cortex_mask,
+    msd,
+    global_entropy,
+    radius_function,
+    perimeter_function,
+    anisotropy_function,
+    local_entropy_function,
+):
     """Write tabular results CSV."""
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, csv_filename)
@@ -287,34 +298,65 @@ def save_results_csv(output_dir, csv_filename, cortex_mask, msd, radius_function
     n_vertices = int(len(cortex_mask))
     if len(msd) != n_vertices:
         raise ValueError("MSD array must match cortex_mask length for CSV output.")
-    if not isinstance(radius_function, dict) or not isinstance(perimeter_function, dict):
-        raise ValueError("radius_function and perimeter_function must be dicts keyed by scale.")
-    if set(radius_function.keys()) != set(perimeter_function.keys()):
-        raise ValueError("radius_function and perimeter_function must share the same scale keys.")
+    if len(global_entropy) != n_vertices:
+        raise ValueError("global_entropy array must match cortex_mask length for CSV output.")
+    if (
+        not isinstance(radius_function, dict)
+        or not isinstance(perimeter_function, dict)
+        or not isinstance(anisotropy_function, dict)
+        or not isinstance(local_entropy_function, dict)
+    ):
+        raise ValueError(
+            "radius_function, perimeter_function, anisotropy_function, and local_entropy_function must be dicts keyed by scale."
+        )
+    keys = set(radius_function.keys())
+    if (
+        keys != set(perimeter_function.keys())
+        or keys != set(anisotropy_function.keys())
+        or keys != set(local_entropy_function.keys())
+    ):
+        raise ValueError(
+            "radius_function, perimeter_function, anisotropy_function, and local_entropy_function must share the same scale keys."
+        )
 
     scale_keys = list(radius_function.keys())
     radius_arrays = {}
     perimeter_arrays = {}
+    anisotropy_arrays = {}
+    local_entropy_arrays = {}
     for scale_key in scale_keys:
         r_arr = np.asarray(radius_function[scale_key])
         p_arr = np.asarray(perimeter_function[scale_key])
-        if r_arr.shape[0] != n_vertices or p_arr.shape[0] != n_vertices:
+        a_arr = np.asarray(anisotropy_function[scale_key])
+        le_arr = np.asarray(local_entropy_function[scale_key])
+        if (
+            r_arr.shape[0] != n_vertices
+            or p_arr.shape[0] != n_vertices
+            or a_arr.shape[0] != n_vertices
+            or le_arr.shape[0] != n_vertices
+        ):
             raise ValueError("All metric arrays must match cortex_mask length for CSV output.")
         radius_arrays[scale_key] = r_arr
         perimeter_arrays[scale_key] = p_arr
+        anisotropy_arrays[scale_key] = a_arr
+        local_entropy_arrays[scale_key] = le_arr
 
     with open(path, "w", encoding="utf-8") as f:
-        header = ["vertex_id", "is_cortex", "msd"]
+        header = ["vertex_id", "is_cortex", "msd", "global_entropy"]
         for scale_key in scale_keys:
             token = format(float(scale_key), "g")
             header.append(f"radius_{token}")
             header.append(f"perimeter_{token}")
+            header.append(f"anisotropy_{token}")
+            header.append(f"local_entropy_{token}")
         f.write(",".join(header) + "\n")
         for i in range(n_vertices):
-            fields = [str(i), str(int(bool(cortex_mask[i]))), str(float(msd[i]))]
+            fields = [str(i), str(int(bool(cortex_mask[i]))), str(float(msd[i])), str(float(global_entropy[i]))]
             for scale_key in scale_keys:
                 fields.append(str(float(radius_arrays[scale_key][i])))
                 fields.append(str(float(perimeter_arrays[scale_key][i])))
+                fields.append(str(float(anisotropy_arrays[scale_key][i])))
+                fields.append(str(float(local_entropy_arrays[scale_key][i])))
             f.write(",".join(fields) + "\n")
     return path
 

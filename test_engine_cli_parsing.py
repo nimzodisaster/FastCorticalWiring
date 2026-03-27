@@ -74,6 +74,18 @@ class EngineCliParsingTests(unittest.TestCase):
         self.assertIn("--sample SAMPLE", text)
         self.assertIn("--sample-kind {frac,count}", text)
         self.assertIn("--sample-method {stratified,random,fps}", text)
+        self.assertNotIn("--no-compute-msd", text)
+
+    def test_no_compute_msd_flag_is_rejected(self):
+        proc = subprocess.run(
+            [sys.executable, "fastcw.py", "--no-compute-msd", "subjects_dir", "subject_id"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        text = proc.stdout + proc.stderr
+        self.assertIn("unrecognized arguments", text)
 
     def test_scale_accepts_single_value(self):
         proc = subprocess.run(
