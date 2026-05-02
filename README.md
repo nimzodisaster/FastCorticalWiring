@@ -48,13 +48,13 @@ This package computes intrinsic wiring metrics at each cortical vertex:
   The perimeter of the geodesic disc defined by the radius function. Related to the cost of connecting to neighboring cortical territories.
 
 * **Interior-Disk Anisotropy**
-  Area-weighted covariance anisotropy of vertices inside each geodesic disk (`d <= r_scale`) after tangent-plane projection.
+  Area-weighted covariance anisotropy of vertices inside each geodesic disk (`d <= r_scale`). By default this uses tangent-plane projection; `--compute-anisotropy` enables potpourri3d log-map coordinates.
 
-* **Global Entropy**
-  Area-weighted Shannon entropy of per-seed geodesic distances, normalized by that seed's MSD.
+* **Distance to Boundary**
+  Geodesic distance from each vertex to the nearest physical submesh boundary, useful for filtering large-radius finite-size effects.
 
-* **Local Entropy (per scale)**
-  Area-weighted Shannon entropy of distances inside each geodesic disk (`d <= r_scale`), normalized by `r_scale`.
+* **Sampled Radius/Area Pairs**
+  Bisection and supplementary `(radius, area)` samples are saved so downstream scale-law fitting can be redone without rerunning geodesics.
 
 These metrics provide quantitative descriptions of cortical spatial organization and intrinsic wiring constraints.
 
@@ -132,9 +132,10 @@ Automatically restricts computation to cortex label:
 
 Produces both analysis-ready and visualization-ready outputs:
 
-* CSV tables with per-vertex metrics (`msd`, `global_entropy`, and per-scale local measures)
+* CSV tables with per-vertex metrics (`msd` and per-scale local measures)
 * FreeSurfer `.mgh` overlays
 * fsLR `.shape.gii` overlays
+* compressed `*_wiring_samples.npz` files with sampled `(radius, area)` pairs
 * compatible with FreeSurfer, nilearn, PySurfer, etc.
 
 ---
@@ -150,6 +151,12 @@ distance_engines.py
 
 fastcw.py
     Canonical CLI interface and orchestration (default engine: potpourri)
+
+run_pipeline.py
+    NUMA-aware batch runner for native-space subject processing
+
+one_off_scripts/fastcw_derived_metrics_to_schaefer.py
+    Native-space parcel summary helper for radius/perimeter-derived metrics
 ```
 
 ---
@@ -194,21 +201,37 @@ Common options:
 --hemispheres lh rh
 --surf-type pial
 --custom-label cortex
---scale 0.001 0.005 0.01 0.05
+--scale 0.002 0.00267988 ... 0.05
 --area-tol 0.01
 --engine potpourri|pygeodesic|pycortex
+--n-samples-between-scales 3
+--boundary-cap-fraction 0.5
+--compute-anisotropy
 --overwrite
 ```
 
-MSD is always computed (required for global entropy normalization).
+MSD is always computed. The default scale set contains 12 log-spaced local area fractions from `0.002` to `0.05`.
 
 Example:
 
 ```
 python fastcw.py $SUBJECTS_DIR fsaverage \
   --hemispheres lh rh \
-  --scale 0.01 0.05
+  --scale 0.005 0.01 0.05
 ```
+
+The CLI writes scalar outputs plus a compressed sample archive named like:
+
+```
+{subject}_{hemi}_{surf}_wiring_samples.npz
+```
+
+The NPZ contains:
+
+* `sampled_radii`, `sampled_areas`: NaN-padded `float32` arrays shaped `(n_vertices, max_samples)`
+* `n_samples_per_vertex`: row-wise valid sample counts
+* `sample_scales_solved`, `n_samples_between_scales`, `boundary_cap_fraction`
+* `cortex_mask`, `sub_to_orig`
 
 ---
 
@@ -252,11 +275,13 @@ Typical performance on fsaverage6 (~41k vertices):
 
 | Metric                          | Time                          |
 | ------------------------------- | ----------------------------- |
-| Radius + Perimeter + Anisotropy + Local Entropy | seconds–minutes   |
-| MSD + Global Entropy                            | minutes            |
+| Radius + Perimeter + Anisotropy | seconds–minutes              |
+| MSD                             | minutes                       |
 | Full hemisphere                 | practical on workstation CPUs |
 
 Performance scales approximately linearly with number of vertices.
+
+The radius phase uses vectorized fully-inside triangle accumulation and band-only clipping around isolines. `--n-samples-between-scales` adds a small amount of area-integration work after the scale radii have been solved. `--boundary-cap-fraction` filters only supplementary samples near mesh boundaries; converged target-scale samples are always retained. Use `--boundary-cap-fraction none` to disable this filter.
 
 ---
 
@@ -343,35 +368,7 @@ Higher values:
 * elongated local neighborhoods
 * directionally biased intrinsic geometry
 
----
-
-### Global entropy
-
-Represents diversity of full-surface geodesic distances from each seed vertex after MSD normalization.
-
-Higher values:
-
-* broader, more even normalized distance distributions
-
-Lower values:
-
-* concentrated normalized distance distributions
-
----
-
-### Local entropy
-
-Represents diversity of distances inside each interior geodesic disk (`d <= r_scale`) after radius normalization.
-
-Higher values:
-
-* more heterogeneous local radial structure
-
-Lower values:
-
-* tighter local distance concentration
-
----
+The default path uses a fast tangent-plane projection. `--compute-anisotropy` uses potpourri3d's vector heat log map when available; if log-map support is unavailable, intrinsic anisotropy values are emitted as `NaN` unless `--strict-anisotropy` is set, in which case initialization fails immediately.
 
 ## Optimization summary
 

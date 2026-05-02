@@ -62,8 +62,6 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
         analysis._find_radius_for_area = lambda *args, **kwargs: 1.0
         analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
         analysis._disk_anisotropy_from_vertices = lambda *args, **kwargs: 0.25
-        analysis._local_entropy_from_distances = lambda *args, **kwargs: 0.5
-        analysis._global_entropy_from_distances = lambda *args, **kwargs: 1.2
 
         analysis.compute_all_wiring_costs(
             compute_msd=True,
@@ -78,16 +76,53 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
             self.assertTrue(np.isfinite(analysis.radius_function[scale_key][idx]))
             self.assertTrue(np.isfinite(analysis.perimeter_function[scale_key][idx]))
             self.assertTrue(np.isfinite(analysis.anisotropy_function[scale_key][idx]))
-            self.assertTrue(np.isfinite(analysis.global_entropy[idx]))
-            self.assertTrue(np.isfinite(analysis.local_entropy_function[scale_key][idx]))
+            n_samples = int(analysis.n_samples_per_vertex[idx])
+            self.assertGreaterEqual(n_samples, 1)
+            self.assertTrue(np.any(np.isclose(analysis.sampled_radii[idx, :n_samples], 1.0)))
 
         for idx in (1, 3, 4):
             self.assertTrue(np.isnan(analysis.msd[idx]))
             self.assertTrue(np.isnan(analysis.radius_function[scale_key][idx]))
             self.assertTrue(np.isnan(analysis.perimeter_function[scale_key][idx]))
             self.assertTrue(np.isnan(analysis.anisotropy_function[scale_key][idx]))
-            self.assertTrue(np.isnan(analysis.global_entropy[idx]))
-            self.assertTrue(np.isnan(analysis.local_entropy_function[scale_key][idx]))
+
+    def test_requested_intrinsic_anisotropy_does_not_use_extrinsic_fallback(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        cortex_mask = np.ones(vertices.shape[0], dtype=bool)
+
+        with mock.patch("core_analysis.create_distance_engine", side_effect=_dummy_engine_factory):
+            analysis = FastCorticalWiringAnalysis(
+                vertices,
+                faces,
+                cortex_mask,
+                engine_type="potpourri",
+                eps=1e-6,
+                metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
+            )
+
+        analysis._find_radius_for_area = lambda *args, **kwargs: 1.0
+        analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
+        analysis._disk_anisotropy_from_vertices = lambda *args, **kwargs: 0.25
+
+        analysis.compute_all_wiring_costs(
+            compute_msd=True,
+            scale=0.2,
+            area_tol=0.1,
+            vertex_subset=[0],
+            compute_anisotropy=True,
+        )
+
+        scale_key = FastCorticalWiringAnalysis.normalize_scales(0.2)[0]
+        self.assertTrue(np.isnan(analysis.anisotropy_function[scale_key][0]))
 
     def test_multiscale_solving_uses_sorted_scales_and_cold_start_bounds(self):
         vertices = np.array(
@@ -170,7 +205,6 @@ class _StubAnalysis:
         self.cortex_mask_full = np.asarray(cortex_mask, dtype=bool)
         self.n_vertices_full = n
         self.msd = np.full(n, np.nan, dtype=np.float32)
-        self.global_entropy = np.full(n, np.nan, dtype=np.float32)
         self.active_scales = tuple(self.DEFAULT_SCALES)
         self.radius_function = {
             float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
@@ -179,9 +213,6 @@ class _StubAnalysis:
             float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
         }
         self.anisotropy_function = {
-            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
-        }
-        self.local_entropy_function = {
             float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
         }
 
@@ -199,19 +230,15 @@ class _StubAnalysis:
         self.anisotropy_function = {
             float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
         }
-        self.local_entropy_function = {
-            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
-        }
         return self.msd, self.radius_function, self.perimeter_function
 
     def get_metric_arrays(self):
-        out = {"msd": self.msd, "global_entropy": self.global_entropy}
+        out = {"msd": self.msd}
         for scale in self.active_scales:
             token = FastCorticalWiringAnalysis.scale_token(scale)
             out[f"radius_{token}"] = self.radius_function[float(scale)]
             out[f"perimeter_{token}"] = self.perimeter_function[float(scale)]
             out[f"anisotropy_{token}"] = self.anisotropy_function[float(scale)]
-            out[f"local_entropy_{token}"] = self.local_entropy_function[float(scale)]
         return out
 
 
@@ -306,11 +333,9 @@ class MetricNameRegistrationTests(unittest.TestCase):
     def test_metric_names_for_scales_include_anisotropy(self):
         names = fastcw._metric_names_for_scales((0.05,))
         self.assertIn("msd", names)
-        self.assertIn("global_entropy", names)
         self.assertIn("radius_0.05", names)
         self.assertIn("perimeter_0.05", names)
         self.assertIn("anisotropy_0.05", names)
-        self.assertIn("local_entropy_0.05", names)
 
 
 class NamingSuffixTests(unittest.TestCase):

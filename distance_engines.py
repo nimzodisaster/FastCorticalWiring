@@ -93,7 +93,7 @@ class PotpourriDistanceEngine(BaseDistanceEngine):
                 "====================================================================\n"
             )
 
-        kwargs = {"use_robust": True}
+        kwargs = {"use_robust": False}
         kwargs.update(self.engine_kwargs)
         self._solver = pp3d.MeshHeatMethodDistanceSolver(self.vertices, self.faces, **kwargs)
 

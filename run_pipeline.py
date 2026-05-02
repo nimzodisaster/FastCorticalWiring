@@ -224,6 +224,7 @@ def build_fastcw_cmd(args, subject):
     if args.no_mask: cmd.append("--no-mask")
     if args.no_compute_msd: cmd.append("--no-compute-msd")
     if args.overwrite: cmd.append("--overwrite")
+    cmd.extend(["--output-label", args.output_label])
     if args.output_dir: cmd.extend(["--output-dir", args.output_dir])
     if args.output_format: cmd.extend(["--output-format", args.output_format])
     if args.engine: cmd.extend(["--engine", args.engine])
@@ -233,8 +234,16 @@ def build_fastcw_cmd(args, subject):
             cmd.extend(["--sample-kind", str(args.sample_kind)])
     if args.sample_method is not None: cmd.extend(["--sample-method", args.sample_method])
     if args.vertex_list: cmd.extend(["--vertex-list", args.vertex_list])
+    if args.compute_anisotropy: cmd.append("--compute-anisotropy")
+    if args.strict_anisotropy: cmd.append("--strict-anisotropy")
 
-    cmd.extend(["--scale", *[str(s) for s in args.scale], "--area-tol", str(args.area_tol), "--eps", str(args.eps)])
+    cmd.extend([
+        "--scale", *[str(s) for s in args.scale],
+        "--area-tol", str(args.area_tol),
+        "--eps", str(args.eps),
+        "--n-samples-between-scales", str(args.n_samples_between_scales),
+        "--boundary-cap-fraction", "none" if args.boundary_cap_fraction is None else str(args.boundary_cap_fraction),
+    ])
     for item in args.engine_kw:
         cmd.extend(["--engine-kw", item])
 
@@ -272,6 +281,11 @@ def main():
     parser.add_argument("--mask", default=None, help="Optional explicit mask path")
     parser.add_argument("--no-mask", action="store_true", help="Run FastCW without cortical masking")
     parser.add_argument("--output-dir", default=None, help="Optional output directory")
+    parser.add_argument(
+        "--output-label",
+        required=True,
+        help="Required FastCW run label; default outputs go under each subject's surf/<label>/ directory",
+    )
     parser.add_argument("--output-format", default=None, help="Optional FastCW output format override")
     parser.add_argument("--engine", default=None, help="Optional FastCW geodesic engine")
     parser.add_argument(
@@ -299,9 +313,52 @@ def main():
     )
     parser.add_argument("--vertex-list", default=None, help="Subset by vertex-index list file")
     parser.add_argument("--no-compute-msd", action="store_true", help="Disable MSD computation")
-    parser.add_argument("--scale", nargs="+", type=float, default=[0.001, 0.005, 0.01, 0.05], help="One or more scales for local measures")
+    parser.add_argument(
+        "--scale",
+        nargs="+",
+        type=float,
+        default=[
+            0.00200000,
+            0.00267988,
+            0.00359088,
+            0.00481157,
+            0.00644721,
+            0.00863888,
+            0.01157558,
+            0.01551059,
+            0.02078326,
+            0.02784833,
+            0.03731509,
+            0.05000000,
+        ],
+        help="One or more scales for local measures",
+    )
     parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area search")
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
+    parser.add_argument(
+        "--n-samples-between-scales",
+        type=int,
+        default=3,
+        help="Supplementary log-spaced area samples between adjacent solved scale radii",
+    )
+    parser.add_argument(
+        "--boundary-cap-fraction",
+        type=lambda raw: None if str(raw).strip().lower() in {"none", "null", "off", "false", "disable", "disabled"} else float(raw),
+        default=0.5,
+        help="Skip supplementary samples beyond this fraction of distance-to-boundary; use 'none' to disable",
+    )
+    parser.add_argument(
+        "--compute-anisotropy",
+        action="store_true",
+        default=False,
+        help="Enable intrinsic log-map anisotropy in FastCW",
+    )
+    parser.add_argument(
+        "--strict-anisotropy",
+        action="store_true",
+        default=False,
+        help="Fail if FastCW cannot initialize log-map anisotropy",
+    )
     parser.add_argument("-j", "--jobs", type=int, default=14, help="Number of parallel processes")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")

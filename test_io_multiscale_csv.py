@@ -7,14 +7,13 @@ import unittest
 
 import numpy as np
 
-from io_utils import save_results_csv
+from io_utils import load_sampled_pairs, save_analysis_npz, save_results_csv
 
 
 class MultiScaleCsvTests(unittest.TestCase):
     def test_csv_contains_dynamic_scale_columns(self):
         cortex_mask = np.array([True, False, True], dtype=bool)
         msd = np.array([1.0, np.nan, 2.0], dtype=np.float32)
-        global_entropy = np.array([1.1, np.nan, 1.3], dtype=np.float32)
         radius = {
             0.001: np.array([0.1, np.nan, 0.2], dtype=np.float32),
             0.05: np.array([1.1, np.nan, 1.2], dtype=np.float32),
@@ -27,10 +26,6 @@ class MultiScaleCsvTests(unittest.TestCase):
             0.001: np.array([0.05, np.nan, 0.07], dtype=np.float32),
             0.05: np.array([0.15, np.nan, 0.17], dtype=np.float32),
         }
-        local_entropy = {
-            0.001: np.array([0.45, np.nan, 0.47], dtype=np.float32),
-            0.05: np.array([0.85, np.nan, 0.87], dtype=np.float32),
-        }
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = save_results_csv(
@@ -38,11 +33,9 @@ class MultiScaleCsvTests(unittest.TestCase):
                 "results.csv",
                 cortex_mask,
                 msd,
-                global_entropy,
                 radius,
                 perimeter,
                 anisotropy,
-                local_entropy,
             )
             self.assertTrue(os.path.exists(out_path))
             with open(out_path, "r", encoding="utf-8") as f:
@@ -51,21 +44,44 @@ class MultiScaleCsvTests(unittest.TestCase):
         self.assertGreaterEqual(len(lines), 2)
         self.assertEqual(
             lines[0],
-            "vertex_id,is_cortex,msd,global_entropy,radius_0.001,perimeter_0.001,anisotropy_0.001,local_entropy_0.001,radius_0.05,perimeter_0.05,anisotropy_0.05,local_entropy_0.05",
+            "vertex_id,is_cortex,msd,radius_0.001,perimeter_0.001,anisotropy_0.001,radius_0.05,perimeter_0.05,anisotropy_0.05",
         )
         row0 = lines[1].split(",")
         self.assertEqual(row0[0], "0")
         self.assertEqual(row0[1], "1")
         self.assertAlmostEqual(float(row0[2]), 1.0, places=6)
-        self.assertAlmostEqual(float(row0[3]), 1.1, places=6)
-        self.assertAlmostEqual(float(row0[4]), 0.1, places=6)
-        self.assertAlmostEqual(float(row0[5]), 0.3, places=6)
-        self.assertAlmostEqual(float(row0[6]), 0.05, places=6)
-        self.assertAlmostEqual(float(row0[7]), 0.45, places=6)
-        self.assertAlmostEqual(float(row0[8]), 1.1, places=6)
-        self.assertAlmostEqual(float(row0[9]), 1.3, places=6)
-        self.assertAlmostEqual(float(row0[10]), 0.15, places=6)
-        self.assertAlmostEqual(float(row0[11]), 0.85, places=6)
+        self.assertAlmostEqual(float(row0[3]), 0.1, places=6)
+        self.assertAlmostEqual(float(row0[4]), 0.3, places=6)
+        self.assertAlmostEqual(float(row0[5]), 0.05, places=6)
+        self.assertAlmostEqual(float(row0[6]), 1.1, places=6)
+        self.assertAlmostEqual(float(row0[7]), 1.3, places=6)
+        self.assertAlmostEqual(float(row0[8]), 0.15, places=6)
+
+
+class SampledPairsNpzTests(unittest.TestCase):
+    def test_npz_roundtrip_preserves_sample_arrays(self):
+        class _Analysis:
+            active_scales = (0.001, 0.05)
+            n_samples_between_scales = 3
+            cortex_mask_full = np.array([True, False, True], dtype=bool)
+            sub_to_orig = np.array([0, 2], dtype=np.int32)
+            sampled_radii = np.array([[0.1, 0.2, np.nan], [np.nan, np.nan, np.nan], [0.3, np.nan, np.nan]], dtype=np.float32)
+            sampled_areas = np.array([[1.0, 2.0, np.nan], [np.nan, np.nan, np.nan], [3.0, np.nan, np.nan]], dtype=np.float32)
+            n_samples_per_vertex = np.array([2, 0, 1], dtype=np.int32)
+
+            def get_metric_arrays(self):
+                return {"msd": np.array([1.0, np.nan, 2.0], dtype=np.float32)}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = save_analysis_npz(tmpdir, "samples.npz", _Analysis())
+            loaded = load_sampled_pairs(path)
+            try:
+                np.testing.assert_array_equal(loaded["sampled_radii"], _Analysis.sampled_radii)
+                np.testing.assert_array_equal(loaded["sampled_areas"], _Analysis.sampled_areas)
+                np.testing.assert_array_equal(loaded["n_samples_per_vertex"], _Analysis.n_samples_per_vertex)
+                np.testing.assert_array_equal(loaded["sample_scales_solved"], np.array([0.001, 0.05], dtype=np.float64))
+            finally:
+                loaded.close()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import re
 
 import numpy as np
 
@@ -10,14 +11,25 @@ from core_analysis import FastCorticalWiringAnalysis
 from io_utils import infer_output_basename, select_vertex_subset
 
 
+def _validate_output_label(label):
+    text = str(label or "").strip()
+    if not text:
+        raise ValueError("--output-label is required and cannot be empty.")
+    if text in {".", ".."} or os.path.basename(text) != text or os.path.isabs(text):
+        raise ValueError("--output-label must be a simple directory name, not a path.")
+    if not re.match(r"^[A-Za-z0-9._-]+$", text):
+        raise ValueError("--output-label may only contain letters, numbers, dots, underscores, and hyphens.")
+    return text
+
+
 def _metric_names_for_scales(scales):
-    names = ["msd", "global_entropy"]
+    names = ["msd"]
     for scale in scales:
         token = FastCorticalWiringAnalysis.scale_token(scale)
         names.append(f"radius_{token}")
         names.append(f"perimeter_{token}")
         names.append(f"anisotropy_{token}")
-        names.append(f"local_entropy_{token}")
+    names.append("dist_to_boundary")
     return tuple(names)
 
 
@@ -50,7 +62,8 @@ def _resolve_naming(metadata, output_dir, output_basename=None, suffix=""):
     if positional_fs_mode and subject_dir and subject_id and hemi and surf_type:
         standard_surf_dir = os.path.abspath(os.path.join(subject_dir, subject_id, "surf"))
         csv_filename = f"{subject_id}_{hemi}_{surf_type}{suffix}_wiring_costs.csv"
-        if output_dir_abs == standard_surf_dir:
+        output_parent = os.path.abspath(os.path.dirname(output_dir_abs))
+        if output_dir_abs == standard_surf_dir or output_parent == standard_surf_dir:
             scalar_stem = f"{hemi}.{surf_type}{suffix}.{{metric}}"
         else:
             scalar_stem = f"{subject_id}_{hemi}_{surf_type}{suffix}.{{metric}}"
@@ -73,6 +86,13 @@ def _format_sampling_suffix(sample_method, sample_frac=None, sample_count=None):
     return ""
 
 
+def _parse_optional_float(raw):
+    text = str(raw).strip().lower()
+    if text in {"none", "null", "off", "false", "disable", "disabled"}:
+        return None
+    return float(raw)
+
+
 def _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem, metric_names):
     out = []
     if "csv" in output_kinds:
@@ -81,11 +101,19 @@ def _expected_output_files(output_dir, output_kinds, csv_filename, scalar_stem, 
         out.extend([os.path.join(output_dir, f"{scalar_stem.format(metric=m)}.mgh") for m in metric_names])
     if "gii" in output_kinds:
         out.extend([os.path.join(output_dir, f"{scalar_stem.format(metric=m)}.shape.gii") for m in metric_names])
+    out.append(os.path.join(output_dir, _sample_npz_filename(csv_filename)))
     return out
 
 
+def _sample_npz_filename(csv_filename):
+    if str(csv_filename).endswith("_wiring_costs.csv"):
+        return str(csv_filename)[: -len("_wiring_costs.csv")] + "_wiring_samples.npz"
+    root, _ = os.path.splitext(str(csv_filename))
+    return f"{root}_wiring_samples.npz"
+
+
 def _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, scalar_stem):
-    from io_utils import save_results_csv, save_results_gifti, save_results_mgh
+    from io_utils import save_analysis_npz, save_results_csv, save_results_gifti, save_results_mgh
 
     metrics = analysis.get_metric_arrays()
     written = []
@@ -96,11 +124,9 @@ def _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, sca
             csv_filename,
             analysis.cortex_mask_full,
             analysis.msd,
-            analysis.global_entropy,
             analysis.radius_function,
             analysis.perimeter_function,
             analysis.anisotropy_function,
-            analysis.local_entropy_function,
         )
         written.append(csv_path)
 
@@ -126,6 +152,7 @@ def _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, sca
             )
         )
 
+    written.append(save_analysis_npz(output_dir, _sample_npz_filename(csv_filename), analysis))
     return written
 
 
@@ -136,6 +163,7 @@ def _run_single_surface(
     mask_path,
     output_dir,
     output_basename,
+    output_label=None,
     subject_dir,
     subject_id,
     hemi,
@@ -150,6 +178,11 @@ def _run_single_surface(
     area_tol,
     eps,
     overwrite,
+    n_samples_between_scales=10,
+    boundary_cap_fraction=0.5,
+    compute_anisotropy=False,
+    strict_anisotropy=False,
+    allow_interior_nonmanifold=False,
     sample=None,
     sample_kind="frac",
     sample_frac=None,
@@ -159,7 +192,7 @@ def _run_single_surface(
     vertex_list=None,
 ):
     from io_utils import load_surface_and_mask
-    # Global entropy depends on MSD normalization; keep MSD computation always on.
+    # Keep MSD computation always on; the flag is retained for compatibility.
     compute_msd = True
 
     vertices, faces, cortex_mask, metadata = load_surface_and_mask(
@@ -176,11 +209,18 @@ def _run_single_surface(
 
     if output_dir is None:
         if metadata.get("legacy_mode") and subject_dir and subject_id:
-            output_dir = os.path.join(subject_dir, subject_id, "surf")
+            if output_label is None:
+                raise ValueError("--output-label is required when writing positional FreeSurfer outputs.")
+            output_dir = os.path.join(subject_dir, subject_id, "surf", _validate_output_label(output_label))
         elif metadata.get("surface_path"):
-            output_dir = os.path.dirname(os.path.abspath(metadata["surface_path"])) or os.getcwd()
+            base_output_dir = os.path.dirname(os.path.abspath(metadata["surface_path"])) or os.getcwd()
+            output_dir = (
+                os.path.join(base_output_dir, _validate_output_label(output_label))
+                if output_label is not None
+                else base_output_dir
+            )
         else:
-            output_dir = os.getcwd()
+            output_dir = os.path.join(os.getcwd(), _validate_output_label(output_label)) if output_label is not None else os.getcwd()
 
     scales = FastCorticalWiringAnalysis.normalize_scales(scale)
     metric_names = _metric_names_for_scales(scales)
@@ -289,20 +329,25 @@ def _run_single_surface(
             sample_method=method,
         )
 
-    analysis = FastCorticalWiringAnalysis(
-        vertices,
-        faces,
-        cortex_mask,
-        engine_type=engine_type,
-        engine_kwargs=engine_kwargs,
-        eps=eps,
-        metadata=metadata,
-    )
+    analysis_kwargs = {
+        "engine_type": engine_type,
+        "engine_kwargs": engine_kwargs,
+        "eps": eps,
+        "metadata": metadata,
+        "allow_interior_nonmanifold": allow_interior_nonmanifold,
+    }
+    if compute_anisotropy or strict_anisotropy:
+        analysis_kwargs["compute_anisotropy"] = compute_anisotropy
+        analysis_kwargs["strict_anisotropy"] = strict_anisotropy
+    analysis = FastCorticalWiringAnalysis(vertices, faces, cortex_mask, **analysis_kwargs)
     analysis.compute_all_wiring_costs(
         compute_msd=compute_msd,
         scale=scales,
         area_tol=area_tol,
         vertex_subset=vertex_subset,
+        n_samples_between_scales=n_samples_between_scales,
+        boundary_cap_fraction=boundary_cap_fraction,
+        compute_anisotropy=compute_anisotropy,
     )
     written = _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, scalar_stem)
 
@@ -313,6 +358,7 @@ def process_subject(
     subject_dir,
     subject_id,
     output_dir=None,
+    output_label=None,
     hemispheres=["lh", "rh"],
     surf_type="pial",
     custom_label=None,
@@ -321,6 +367,11 @@ def process_subject(
     area_tol=0.01,
     eps=1e-6,
     overwrite=False,
+    n_samples_between_scales=10,
+    boundary_cap_fraction=0.5,
+    compute_anisotropy=False,
+    strict_anisotropy=False,
+    allow_interior_nonmanifold=False,
     output_format="auto",
     engine_type="potpourri",
     engine_kwargs=None,
@@ -335,10 +386,12 @@ def process_subject(
     vertex_list=None,
 ):
     """Positional FreeSurfer workflow compatibility entry point."""
-    # Global entropy depends on MSD normalization; keep MSD computation always on.
+    # Keep MSD computation always on; the flag is retained for compatibility.
     compute_msd = True
     if output_dir is None:
-        output_dir = os.path.join(subject_dir, subject_id, "surf")
+        if output_label is None:
+            raise ValueError("--output-label is required when writing positional FreeSurfer outputs.")
+        output_dir = os.path.join(subject_dir, subject_id, "surf", _validate_output_label(output_label))
 
     print("=" * 60)
     print(f"Processing subject: {subject_id}")
@@ -355,6 +408,7 @@ def process_subject(
             surface_path=None,
             mask_path=mask_path,
             output_dir=output_dir,
+            output_label=output_label,
             output_basename=None,
             subject_dir=subject_dir,
             subject_id=subject_id,
@@ -370,6 +424,11 @@ def process_subject(
             area_tol=area_tol,
             eps=eps,
             overwrite=overwrite,
+            n_samples_between_scales=n_samples_between_scales,
+            boundary_cap_fraction=boundary_cap_fraction,
+            compute_anisotropy=compute_anisotropy,
+            strict_anisotropy=strict_anisotropy,
+            allow_interior_nonmanifold=allow_interior_nonmanifold,
             sample=sample,
             sample_kind=sample_kind,
             sample_frac=sample_frac,
@@ -435,13 +494,30 @@ def run_cli(default_engine="potpourri"):
     )
     parser.add_argument("--engine-kw", action="append", default=[], help="Engine-specific option as key=value (repeatable)")
     parser.add_argument(
+        "--use-robust",
+        action="store_true",
+        default=False,
+        help="Enable robust heat method mode for potpourri3d distance solver",
+    )
+    parser.add_argument(
         "--allow-eigen-fallback",
         action="store_true",
         default=False,
         help="Allow potpourri3d Eigen fallback when SuiteSparse check fails",
     )
+    parser.add_argument(
+        "--allow-interior-nonmanifold",
+        action="store_true",
+        default=False,
+        help="Allow processing to continue when interior non-manifold vertices are detected",
+    )
 
-    parser.add_argument("--output-dir", default=None, help="Output directory")
+    parser.add_argument("--output-dir", default=None, help="Output directory override")
+    parser.add_argument(
+        "--output-label",
+        default=None,
+        help="Required run label. In FreeSurfer positional mode outputs are written under each subject's surf/<label>/ directory.",
+    )
     parser.add_argument("--hemispheres", nargs="+", default=["lh", "rh"], help="Hemispheres for positional FreeSurfer mode")
     parser.add_argument("--hemi", default="lh", help="Hemisphere label for explicit surface mode naming")
     parser.add_argument(
@@ -471,6 +547,30 @@ def run_cli(default_engine="potpourri"):
     )
     parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area binary search")
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
+    parser.add_argument(
+        "--n-samples-between-scales",
+        type=int,
+        default=3,
+        help="Supplementary log-spaced area samples between adjacent solved scale radii (0 disables extras; >5 is usually excessive)",
+    )
+    parser.add_argument(
+        "--boundary-cap-fraction",
+        type=_parse_optional_float,
+        default=0.5,
+        help="Skip supplementary radius/area samples beyond this fraction of distance-to-boundary; use 'none' to disable",
+    )
+    parser.add_argument(
+        "--compute-anisotropy",
+        action="store_true",
+        default=False,
+        help="Enable intrinsic log-map anisotropy via potpourri3d MeshVectorHeatSolver",
+    )
+    parser.add_argument(
+        "--strict-anisotropy",
+        action="store_true",
+        default=False,
+        help="Raise an error if log-map anisotropy cannot be initialized",
+    )
     parser.add_argument(
         "--sample",
         type=float,
@@ -539,8 +639,11 @@ def run_cli(default_engine="potpourri"):
         args.sample_count = None
 
     args.sample_vertices = None
+    args.output_label = _validate_output_label(args.output_label)
 
     engine_kwargs = parse_engine_kwargs(args.engine_kw)
+    if args.use_robust:
+        engine_kwargs["use_robust"] = True
     if args.allow_eigen_fallback:
         engine_kwargs["allow_eigen_fallback"] = True
     using_explicit_surface = args.surface is not None
@@ -556,6 +659,7 @@ def run_cli(default_engine="potpourri"):
             surface_path=args.surface,
             mask_path=args.mask,
             output_dir=args.output_dir,
+            output_label=args.output_label,
             output_basename=args.output_basename,
             subject_dir=args.subject_dir,
             subject_id=args.subject_id,
@@ -571,6 +675,11 @@ def run_cli(default_engine="potpourri"):
             area_tol=args.area_tol,
             eps=args.eps,
             overwrite=args.overwrite,
+            n_samples_between_scales=args.n_samples_between_scales,
+            boundary_cap_fraction=args.boundary_cap_fraction,
+            compute_anisotropy=args.compute_anisotropy,
+            strict_anisotropy=args.strict_anisotropy,
+            allow_interior_nonmanifold=args.allow_interior_nonmanifold,
             sample=args.sample,
             sample_kind=args.sample_kind,
             sample_frac=args.sample_frac,
@@ -598,6 +707,7 @@ def run_cli(default_engine="potpourri"):
             args.subject_dir,
             args.subject_id,
             args.output_dir,
+            output_label=args.output_label,
             hemispheres=args.hemispheres,
             surf_type=args.surf_type,
             custom_label=args.custom_label,
@@ -606,6 +716,11 @@ def run_cli(default_engine="potpourri"):
             area_tol=args.area_tol,
             eps=args.eps,
             overwrite=args.overwrite,
+            n_samples_between_scales=args.n_samples_between_scales,
+            boundary_cap_fraction=args.boundary_cap_fraction,
+            compute_anisotropy=args.compute_anisotropy,
+            strict_anisotropy=args.strict_anisotropy,
+            allow_interior_nonmanifold=args.allow_interior_nonmanifold,
             output_format=args.output_format,
             engine_type=args.engine,
             engine_kwargs=engine_kwargs,

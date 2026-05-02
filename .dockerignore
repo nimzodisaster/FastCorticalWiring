@@ -1,0 +1,33 @@
+# Git / local tooling
+.git
+.gitignore
+.codex
+
+# Docker build metadata
+Dockerfile
+.dockerignore
+
+# Python artifacts / local envs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# One-off scripts and scratch helpers (not needed in runtime image)
+one_off_scripts/
+
+# Tests and validation utilities
+test_*.py
+validate_fastcw_pp3d.py
+
+# Local outputs, logs, and data mounts
+logs_fastcw/
+logs/
+inputs/
+subjects/
+outputs/
+*.log

@@ -31,6 +31,63 @@ import warnings
 from distance_engines import create_distance_engine
 warnings.filterwarnings('ignore')
 
+
+def classify_nonmanifold_vertices(vertices, faces):
+    """
+    Classify boundary and non-manifold vertices from a triangle mesh.
+
+    Args:
+        vertices: Vertex coordinates with shape (N, 3). Used for indexing bounds.
+        faces: Triangle indices with shape (M, 3).
+
+    Returns:
+        dict with keys:
+            boundary_verts: set of vertex ids on boundary edges (edge has exactly one face)
+            non_manifold_verts: set of vertex ids on non-manifold edges (edge has >2 faces)
+            also_boundary: set intersection of boundary_verts and non_manifold_verts
+            interior: set of non_manifold_verts not on boundary
+    """
+    V = np.asarray(vertices)
+    F = np.asarray(faces)
+    if V.ndim != 2 or V.shape[1] != 3:
+        raise ValueError(f"Invalid vertex array shape {V.shape}; expected (N, 3).")
+    if F.ndim != 2 or F.shape[1] != 3:
+        raise ValueError(f"Invalid face array shape {F.shape}; expected (M, 3).")
+    if F.size == 0:
+        return {
+            "boundary_verts": set(),
+            "non_manifold_verts": set(),
+            "also_boundary": set(),
+            "interior": set(),
+        }
+
+    edge_faces = {}
+    for fi, tri in enumerate(F):
+        i0, i1, i2 = int(tri[0]), int(tri[1]), int(tri[2])
+        for a, b in ((i0, i1), (i1, i2), (i2, i0)):
+            edge = (a, b) if a < b else (b, a)
+            edge_faces.setdefault(edge, []).append(fi)
+
+    boundary_verts = set()
+    non_manifold_verts = set()
+    for (a, b), face_list in edge_faces.items():
+        count = len(face_list)
+        if count == 1:
+            boundary_verts.add(a)
+            boundary_verts.add(b)
+        elif count > 2:
+            non_manifold_verts.add(a)
+            non_manifold_verts.add(b)
+
+    also_boundary = non_manifold_verts & boundary_verts
+    interior = non_manifold_verts - boundary_verts
+    return {
+        "boundary_verts": boundary_verts,
+        "non_manifold_verts": non_manifold_verts,
+        "also_boundary": also_boundary,
+        "interior": interior,
+    }
+
 # ============================================================================
 # OPTIONAL DEPENDENCIES: Numba JIT
 # ============================================================================
@@ -113,7 +170,7 @@ if NUMBA_AVAILABLE:
         return 0.5 * abs(n[0] * cx + n[1] * cy + n[2] * cz)
 
     @njit(fastmath=True, cache=True)
-    def _area_inside_radius_kernel(V, F, unit_normals, face_areas, face_L, distances, r, eps, cand_idx):
+    def _area_inside_radius_band_kernel(V, F, unit_normals, face_areas, face_L, distances, r, eps, band_idx):
         area_sum = 0.0
         abs_tol = eps
         rel_tol = 1e-9
@@ -123,8 +180,8 @@ if NUMBA_AVAILABLE:
         P1 = np.zeros(3, dtype=np.float64)
         P2 = np.zeros(3, dtype=np.float64)
         
-        for k in range(cand_idx.shape[0]):
-            f_idx = cand_idx[k]
+        for k in range(band_idx.shape[0]):
+            f_idx = band_idx[k]
             i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
             d0, d1, d2 = distances[i0], distances[i1], distances[i2]
             
@@ -344,7 +401,14 @@ class FastCorticalWiringAnalysis:
     - cortex_mask: (N,) boolean mask
     """
 
-    DEFAULT_SCALES = (0.001, 0.005, 0.01, 0.05)
+    DEFAULT_SCALES = (
+        0.00060000,
+        0.00100000,
+        0.00200000,
+        0.00400000,
+        0.0080000,
+        0.01600000,
+    )
 
     def __init__(
         self,
@@ -355,6 +419,9 @@ class FastCorticalWiringAnalysis:
         engine_kwargs=None,
         eps=1e-6,
         metadata=None,
+        compute_anisotropy=False,
+        strict_anisotropy=False,
+        allow_interior_nonmanifold=False,
     ):
         """
         Initialize analysis from in-memory mesh arrays.
@@ -367,6 +434,16 @@ class FastCorticalWiringAnalysis:
             engine_kwargs: Optional backend-specific kwargs
             eps: Numerical tolerance for geometric computations
             metadata: Optional metadata dict for provenance/naming
+            compute_anisotropy: Initialize potpourri3d vector heat log-map solver
+            strict_anisotropy: Raise if log-map anisotropy cannot be initialized
+            allow_interior_nonmanifold: Continue even when interior non-manifold
+                vertices are detected in the cortical submesh.
+
+        Notes:
+            use_robust=True is required for non-manifold interior geometry.
+            FreeSurfer pial surfaces decimated with PyVista may contain
+            non-manifold edges confined to medial wall boundaries; those can be
+            safe to ignore for geodesic distance use in this pipeline.
         """
         V, F, M = self._validate_mesh_inputs(vertices, faces, cortex_mask)
         self.engine_type = str(engine_type).lower()
@@ -378,6 +455,9 @@ class FastCorticalWiringAnalysis:
         self.surf_type = self.metadata.get("surf_type", "surface")
         self.eps = float(eps)
         self.custom_label = self.metadata.get("custom_label")
+        self.compute_anisotropy = bool(compute_anisotropy)
+        self.strict_anisotropy = bool(strict_anisotropy)
+        self.allow_interior_nonmanifold = bool(allow_interior_nonmanifold)
 
         # Input mesh in original vertex space
         self.vertices_full = V
@@ -399,6 +479,31 @@ class FastCorticalWiringAnalysis:
             self.sub_to_orig,       # Map from submesh to original vertex indices
             self.orig_to_sub,       # Map from original to submesh vertex indices
         ) = self._build_cortex_submesh(self.vertices_full, self.faces_full, self.cortex_mask_full)
+
+        manifold_report = classify_nonmanifold_vertices(self.vertices, self.faces)
+        n_boundary = len(manifold_report["boundary_verts"])
+        n_non_manifold = len(manifold_report["non_manifold_verts"])
+        n_also_boundary = len(manifold_report["also_boundary"])
+        n_interior = len(manifold_report["interior"])
+        print(f"Boundary vertices: {n_boundary}")
+        print(f"Non-manifold vertices: {n_non_manifold}")
+        print(f"Non-manifold also on boundary: {n_also_boundary}")
+        print(f"Interior non-manifold vertices: {n_interior}")
+        if n_interior == 0:
+            if n_non_manifold > 0:
+                print("All non-manifold vertices are on the medial wall boundary.")
+            else:
+                print("No non-manifold vertices found.")
+        else:
+            print(
+                f"{n_interior} non-manifold vertices are in the interior — "
+                "geodesic distances may be corrupted."
+            )
+            if not self.allow_interior_nonmanifold:
+                raise RuntimeError(
+                    "Interior non-manifold vertices detected in cortical submesh. "
+                    "Pass allow_interior_nonmanifold=True to continue anyway."
+                )
         
         self.n_vertices = self.vertices.shape[0]
         self.n_faces = self.faces.shape[0]
@@ -412,8 +517,30 @@ class FastCorticalWiringAnalysis:
         F = np.ascontiguousarray(self.faces, dtype=np.int32)
         self.vertices = V
         self.faces = F
+
+        # Identify physical submesh boundaries (free edges appear in exactly one face).
+        edges = np.vstack(
+            (
+                self.faces[:, [0, 1]],
+                self.faces[:, [1, 2]],
+                self.faces[:, [2, 0]],
+            )
+        ).astype(np.int32, copy=False)
+        edges.sort(axis=1)
+        unique_edges, edge_counts = np.unique(edges, axis=0, return_counts=True)
+        boundary_edges = unique_edges[edge_counts == 1]
+        if boundary_edges.size:
+            self.boundary_indices = np.unique(boundary_edges.reshape(-1)).astype(np.int32, copy=False)
+        else:
+            self.boundary_indices = np.empty((0,), dtype=np.int32)
+
         self.distance_engine = create_distance_engine(self.engine_type, V, F, self.engine_kwargs)
         print(f"Geodesic backend: {self.distance_engine.name}")
+
+        self._vector_heat_solver = None
+        self._vector_heat_unavailable_reason = None
+        if self.compute_anisotropy:
+            self._initialize_vector_heat_solver(strict=self.strict_anisotropy)
 
         # Cache face columns and reusable scratch buffers for per-face distance bounds.
         self._f0 = np.ascontiguousarray(self.faces[:, 0])
@@ -450,10 +577,43 @@ class FastCorticalWiringAnalysis:
         self.anisotropy_function = {
             float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
         }
-        self.global_entropy = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
-        self.local_entropy_function = {
-            float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
-        }
+        self.dist_to_boundary = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
+        self.sampled_radii = None
+        self.sampled_areas = None
+        self.n_samples_per_vertex = None
+        self.n_samples_between_scales = 0
+        self.boundary_cap_fraction = None
+
+    def _initialize_vector_heat_solver(self, strict=False):
+        """Initialize potpourri3d's vector heat solver for log-map anisotropy."""
+        if self._vector_heat_solver is not None:
+            return
+        if self._vector_heat_unavailable_reason is not None and not strict:
+            return
+        try:
+            import potpourri3d as pp3d
+        except Exception as exc:
+            self._vector_heat_unavailable_reason = (
+                "potpourri3d is required for log-map anisotropy. "
+                "Install a version with MeshVectorHeatSolver.compute_log_map."
+            )
+            if strict:
+                raise ImportError(self._vector_heat_unavailable_reason) from exc
+            warnings.warn(self._vector_heat_unavailable_reason, RuntimeWarning)
+            return
+
+        solver_cls = getattr(pp3d, "MeshVectorHeatSolver", None)
+        if solver_cls is None or not hasattr(solver_cls, "compute_log_map"):
+            self._vector_heat_unavailable_reason = (
+                "Installed potpourri3d does not expose MeshVectorHeatSolver.compute_log_map; "
+                "upgrade potpourri3d to use log-map anisotropy."
+            )
+            if strict:
+                raise RuntimeError(self._vector_heat_unavailable_reason)
+            warnings.warn(self._vector_heat_unavailable_reason, RuntimeWarning)
+            return
+
+        self._vector_heat_solver = solver_cls(self.vertices, self.faces)
 
     @staticmethod
     def normalize_scales(scale):
@@ -540,6 +700,7 @@ class FastCorticalWiringAnalysis:
         custom_label=None,
         mask_path=None,
         no_mask=False,
+        allow_interior_nonmanifold=False,
     ):
         """
         Compatibility constructor for positional FreeSurfer workflows.
@@ -564,6 +725,7 @@ class FastCorticalWiringAnalysis:
             engine_kwargs=engine_kwargs,
             eps=eps,
             metadata=metadata,
+            allow_interior_nonmanifold=allow_interior_nonmanifold,
         )
         
     def _build_cortex_submesh(self, vertices, faces, cortex_mask):
@@ -833,6 +995,85 @@ class FastCorticalWiringAnalysis:
     # AREA AND PERIMETER COMPUTATION (with candidate-face filtering)
     # ========================================================================
     
+    def _area_band_python(self, radius, distances_sub, band_idx):
+        """Python fallback for partially clipped faces in the isoline band."""
+        r = float(radius)
+        eps = self.eps
+        V, F = self.vertices, self.faces
+        area = 0.0
+        unit_normals, areas = self.face_unit_normals, self.face_areas
+
+        for f_idx in band_idx:
+            face = F[f_idx]
+            d = distances_sub[face]
+            if not np.all(np.isfinite(d)):
+                continue
+
+            v_face = V[face]
+            inside = d <= r + eps
+            n_in = int(np.sum(inside))
+
+            if n_in == 0:
+                continue
+            if n_in == 3:
+                area += areas[f_idx]
+                continue
+
+            n = unit_normals[f_idx]
+            if n_in == 1:
+                i_inside = int(np.where(inside)[0][0])
+                P = self._edge_intersections(r, d, v_face, f_idx)
+                if len(P) < 2:
+                    continue
+                a = v_face[i_inside]
+                b, c = P[0], P[1]
+                area += 0.5 * abs(np.dot(n, np.cross(b - a, c - a)))
+            else:
+                idx_out = int(np.where(~inside)[0][0])
+                idx_in = np.where(inside)[0]
+                vo = v_face[idx_out]
+                vi1 = v_face[idx_in[0]]
+                vi2 = v_face[idx_in[1]]
+                do = d[idx_out]
+                di1 = d[idx_in[0]]
+                di2 = d[idx_in[1]]
+
+                p1, p2 = None, None
+                if abs(do - r) <= eps:
+                    p1 = vo
+                elif abs(di1 - r) <= eps:
+                    p1 = vi1
+                else:
+                    den = di1 - do
+                    if abs(den) > 1e-20:
+                        t = (r - do) / den
+                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                        p1 = vo + t * (vi1 - vo)
+
+                if abs(do - r) <= eps:
+                    p2 = vo
+                elif abs(di2 - r) <= eps:
+                    p2 = vi2
+                else:
+                    den = di2 - do
+                    if abs(den) > 1e-20:
+                        t = (r - do) / den
+                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                        p2 = vo + t * (vi2 - vo)
+
+                if p1 is None or p2 is None:
+                    P = self._edge_intersections(r, d, v_face, f_idx)
+                    if len(P) < 2:
+                        continue
+                    p1, p2 = P[0], P[1]
+
+                outside_area = 0.5 * abs(np.dot(n, np.cross(p1 - vo, p2 - vo)))
+                inside_area = areas[f_idx] - outside_area
+                inside_area = max(0.0, min(float(areas[f_idx]), float(inside_area)))
+                area += inside_area
+
+        return float(area)
+
     def _area_inside_radius(self, radius, distances_sub, dmin=None, dmax=None):
         """
         Compute the area of cortical surface within geodesic radius from a source vertex.
@@ -854,86 +1095,32 @@ class FastCorticalWiringAnalysis:
             dmin = df.min(axis=1)
             dmax = df.max(axis=1)
         
-        # Candidate face filtering: only process faces that might contribute
-        # This eliminates most faces and dramatically speeds up computation
-        cand_idx = np.flatnonzero(dmin <= (r + eps)).astype(np.int32, copy=False)
+        fully_in_mask = dmax <= (r - eps)
+        band_mask = (dmin <= (r + eps)) & ~fully_in_mask
+
+        inside_area = float(self.face_areas[fully_in_mask].sum())
+        band_idx = np.flatnonzero(band_mask).astype(np.int32, copy=False)
+
+        if band_idx.size == 0:
+            return inside_area
         
         if NUMBA_AVAILABLE:
-            # Use optimized JIT kernel
-            return float(_area_inside_radius_kernel(V, F, self.face_unit_normals, self.face_areas, self.face_L, distances_sub, r, eps, cand_idx))
+            band_area = float(
+                _area_inside_radius_band_kernel(
+                    V,
+                    F,
+                    self.face_unit_normals,
+                    self.face_areas,
+                    self.face_L,
+                    distances_sub,
+                    r,
+                    eps,
+                    band_idx,
+                )
+            )
+            return inside_area + band_area
         
-        # Pure Python fallback (slower but works without Numba)
-        area = 0.0
-        normals, areas = self.face_normals, self.face_areas
-        for f_idx in cand_idx:
-            face = F[f_idx]
-            d = distances_sub[face]
-            if not np.all(np.isfinite(d)):
-                continue
-                
-            v_face = V[face]
-            inside = d <= r + eps
-            n_in = int(np.sum(inside))
-            
-            if n_in == 0:
-                continue
-            if n_in == 3:
-                area += areas[f_idx]
-                continue
-                
-            # Partial triangle cases
-            if n_in == 1:
-                i_inside = int(np.where(inside)[0][0])
-                P = self._edge_intersections(r, d, v_face, f_idx)
-                if len(P) < 2:
-                    continue
-                a = v_face[i_inside]
-                b, c = P[0], P[1]
-                area += 0.5 * abs(np.dot(normals[f_idx], np.cross(b - a, c - a)))
-            else:  # n_in == 2
-                idx_out = int(np.where(~inside)[0][0])
-                idx_in = np.where(inside)[0]
-                vo = v_face[idx_out]
-                vi1 = v_face[idx_in[0]]
-                vi2 = v_face[idx_in[1]]
-                do = d[idx_out]
-                di1 = d[idx_in[0]]
-                di2 = d[idx_in[1]]
-
-                p1, p2 = None, None
-                if abs(do - r) <= eps:
-                    p1 = vo
-                elif abs(di1 - r) <= eps:
-                    p1 = vi1
-                else:
-                    den = (di1 - do)
-                    if abs(den) > 1e-20:
-                        t = (r - do) / den
-                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-                        p1 = vo + t * (vi1 - vo)
-
-                if abs(do - r) <= eps:
-                    p2 = vo
-                elif abs(di2 - r) <= eps:
-                    p2 = vi2
-                else:
-                    den = (di2 - do)
-                    if abs(den) > 1e-20:
-                        t = (r - do) / den
-                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-                        p2 = vo + t * (vi2 - vo)
-
-                if p1 is None or p2 is None:
-                    P = self._edge_intersections(r, d, v_face, f_idx)
-                    if len(P) < 2:
-                        continue
-                    p1, p2 = P[0], P[1]
-
-                outside_area = 0.5 * abs(np.dot(normals[f_idx], np.cross(p1 - vo, p2 - vo)))
-                inside_area = areas[f_idx] - outside_area
-                inside_area = max(0.0, min(float(areas[f_idx]), float(inside_area)))
-                area += inside_area
-        return float(area)
+        return inside_area + self._area_band_python(r, distances_sub, band_idx)
 
     def _perimeter_at_radius(self, radius, distances_sub, dmin=None, dmax=None):
         """
@@ -992,229 +1179,167 @@ class FastCorticalWiringAnalysis:
                         perim += float(best_d)
         return float(perim)
 
-    def _collect_isoline_segments(self, radius, distances_sub, dmin=None, dmax=None):
+    def _compute_log_map_at_subvertex(self, sub_idx):
         """
-        Collect midpoint + length of each contour segment crossing the radius isoline.
+        Compute tangent-plane log-map coordinates from a source submesh vertex.
+
+        Returns None when log-map anisotropy is not enabled or unavailable.
         """
-        r = float(radius)
-        eps = self.eps
-        V, F = self.vertices, self.faces
+        if self._vector_heat_solver is None:
+            return None
+        log_map = self._vector_heat_solver.compute_log_map(int(sub_idx))
+        log_map = np.asarray(log_map, dtype=np.float64)
+        if log_map.shape != (self.n_vertices, 2):
+            raise ValueError(
+                f"Vector heat log map returned shape {log_map.shape}; expected ({self.n_vertices}, 2)."
+            )
+        return np.ascontiguousarray(log_map)
 
-        if dmin is None or dmax is None:
-            df = distances_sub[F]
-            dmin = df.min(axis=1)
-            dmax = df.max(axis=1)
-
-        band_idx = np.flatnonzero((dmin <= (r + eps)) & (dmax >= (r - eps))).astype(np.int32, copy=False)
-        mids = []
-        lens = []
-
-        for f_idx in band_idx:
-            face = F[f_idx]
-            d = distances_sub[face]
-            if not np.all(np.isfinite(d)):
-                continue
-
-            v_face = V[face]
-            P = self._edge_intersections(r, d, v_face, f_idx)
-            if len(P) == 2:
-                p0 = np.asarray(P[0], dtype=np.float64)
-                p1 = np.asarray(P[1], dtype=np.float64)
-                seg_len = float(np.linalg.norm(p1 - p0))
-                mids.append(0.5 * (p0 + p1))
-                lens.append(seg_len)
-            elif len(P) > 2:
-                used = [False] * len(P)
-                for i in range(len(P)):
-                    if used[i]:
-                        continue
-                    best_j = -1
-                    best_d = 1e30
-                    for j in range(i + 1, len(P)):
-                        if used[j]:
-                            continue
-                        dd = float(np.linalg.norm(P[j] - P[i]))
-                        if dd < best_d:
-                            best_d = dd
-                            best_j = j
-                    if best_j >= 0:
-                        used[i] = used[best_j] = True
-                        p0 = np.asarray(P[i], dtype=np.float64)
-                        p1 = np.asarray(P[best_j], dtype=np.float64)
-                        mids.append(0.5 * (p0 + p1))
-                        lens.append(float(best_d))
-
-        if not mids:
-            return np.empty((0, 3), dtype=np.float64), np.empty((0,), dtype=np.float64)
-        return np.asarray(mids, dtype=np.float64), np.asarray(lens, dtype=np.float64)
-
-    def _circle_anisotropy_at_radius(self, source_sub_idx, radius, distances_sub, dmin=None, dmax=None):
+    def _anisotropy_at_radius(self, log_map_xy, distances_sub, radius):
         """
-        Compute scalar anisotropy from weighted 2D covariance of contour-segment midpoints.
+        Eigenvalue ratio of the area-weighted second-moment tensor of a geodesic disk.
+
+        Returns 1 - lambda_min / lambda_max in [0, 1]. Values near 0 indicate an
+        isotropic disk in tangent coordinates; values near 1 indicate elongation.
         """
-        mids, lens = self._collect_isoline_segments(radius, distances_sub, dmin=dmin, dmax=dmax)
-        if mids.shape[0] < 2:
+        if log_map_xy is None:
             return np.nan
-
-        w = np.asarray(lens, dtype=np.float64)
-        wsum = float(np.sum(w))
-        if not np.isfinite(wsum) or wsum <= 0.0:
-            return np.nan
-
-        seed = np.asarray(self.vertices[int(source_sub_idx)], dtype=np.float64)
-        disp = mids - seed[None, :]
-        e1, e2, _ = self._tangent_frame_at_subvertex(source_sub_idx)
-        x = disp @ e1
-        y = disp @ e2
-
-        cx = float(np.sum(w * x) / wsum)
-        cy = float(np.sum(w * y) / wsum)
-        dx = x - cx
-        dy = y - cy
-
-        cxx = float(np.sum(w * dx * dx) / wsum)
-        cxy = float(np.sum(w * dx * dy) / wsum)
-        cyy = float(np.sum(w * dy * dy) / wsum)
-        cov = np.array([[cxx, cxy], [cxy, cyy]], dtype=np.float64)
-
-        try:
-            evals = np.linalg.eigvalsh(cov)
-        except np.linalg.LinAlgError:
-            return np.nan
-        if evals.size != 2 or not np.all(np.isfinite(evals)):
-            return np.nan
-
-        lam1 = float(evals[1])
-        lam2 = float(evals[0])
-        if lam1 < 0.0:
-            lam1 = 0.0
-        if lam2 < 0.0:
-            lam2 = 0.0
-
-        trace2 = lam1 + lam2
-        tiny = np.finfo(np.float64).eps * 10.0
-        if trace2 <= tiny:
-            return 0.0
-        anis = (lam1 - lam2) / trace2
-        return float(np.clip(anis, 0.0, 1.0))
-
-    def _disk_anisotropy_from_vertices(self, source_sub_idx, distances_sub, radius):
-        """
-        Compute anisotropy from area-weighted 2D covariance of all vertices inside d <= r.
-        """
         r = float(radius)
         if not np.isfinite(r) or r <= 0.0:
             return np.nan
 
         d = np.asarray(distances_sub, dtype=np.float64)
-        mask = np.isfinite(d) & (d <= (r + self.eps))
-        if int(np.sum(mask)) < 10:
+        xy_all = np.asarray(log_map_xy, dtype=np.float64)
+        if xy_all.ndim != 2 or xy_all.shape[1] != 2 or xy_all.shape[0] != d.shape[0]:
             return np.nan
 
-        w = np.asarray(self.vertex_areas_sub[mask], dtype=np.float64)
-        wsum = float(np.sum(w))
-        if not np.isfinite(wsum) or wsum <= np.finfo(np.float64).eps:
+        interior = np.isfinite(d) & (d <= r + self.eps)
+        interior &= np.isfinite(xy_all[:, 0]) & np.isfinite(xy_all[:, 1])
+        if int(np.sum(interior)) < 3:
             return np.nan
 
-        seed = np.asarray(self.vertices[int(source_sub_idx)], dtype=np.float64)
-        disp = np.asarray(self.vertices[mask], dtype=np.float64) - seed[None, :]
-
-        e1, e2, _ = self._tangent_frame_at_subvertex(source_sub_idx)
-        x = disp @ e1
-        y = disp @ e2
-
-        cx = float(np.sum(w * x) / wsum)
-        cy = float(np.sum(w * y) / wsum)
-        dx = x - cx
-        dy = y - cy
-
-        cxx = float(np.sum(w * dx * dx) / wsum)
-        cxy = float(np.sum(w * dx * dy) / wsum)
-        cyy = float(np.sum(w * dy * dy) / wsum)
-        cov = np.array([[cxx, cxy], [cxy, cyy]], dtype=np.float64)
-
-        try:
-            evals = np.linalg.eigh(cov)[0]
-        except np.linalg.LinAlgError:
-            return np.nan
-        if evals.size != 2 or not np.all(np.isfinite(evals)):
-            return np.nan
-
-        lam2 = float(max(evals[0], 0.0))
-        lam1 = float(max(evals[1], 0.0))
-        denom = lam1 + lam2
-        if denom <= np.finfo(np.float64).eps * 10.0:
-            return 0.0
-        anis = (lam1 - lam2) / denom
-        return float(np.clip(anis, 0.0, 1.0))
-
-    def _weighted_entropy_from_normalized_distances(self, d_norm, weights, n_bins=48, lo=0.0, hi=3.0):
-        """
-        Area-weighted Shannon entropy from normalized distances with fixed clipping bins.
-        """
-        x = np.asarray(d_norm, dtype=np.float64)
-        w = np.asarray(weights, dtype=np.float64)
-        if x.ndim != 1 or w.ndim != 1 or x.shape[0] != w.shape[0] or x.size == 0:
-            return np.nan
-
-        finite = np.isfinite(x) & np.isfinite(w) & (w > 0.0)
-        if not np.any(finite):
-            return np.nan
-        x = x[finite]
-        w = w[finite]
-        wsum = float(np.sum(w))
-        if not np.isfinite(wsum) or wsum <= 0.0:
-            return np.nan
-
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo or int(n_bins) <= 0:
-            return np.nan
-        n_bins = int(n_bins)
-        x_clip = np.clip(x, lo, hi)
-        span = hi - lo
-        # Map hi exactly into last bin.
-        frac = (x_clip - lo) / span
-        idx = np.floor(frac * n_bins).astype(np.int64)
-        idx = np.clip(idx, 0, n_bins - 1)
-        hist = np.bincount(idx, weights=w, minlength=n_bins).astype(np.float64, copy=False)
-
-        total = float(np.sum(hist))
-        if not np.isfinite(total) or total <= 0.0:
-            return np.nan
-        p = hist / total
-        p = p[p > 0.0]
-        if p.size == 0:
-            return np.nan
-        return float(-np.sum(p * np.log(p)))
-
-    def _global_entropy_from_distances(self, distances_sub, msd_val):
-        """
-        Global entropy over all cortical vertices, using d_norm = d / MSD(seed).
-        """
-        msd = float(msd_val)
-        if not np.isfinite(msd) or msd <= 0.0:
-            return np.nan
-        d = np.asarray(distances_sub, dtype=np.float64)
-        valid = np.isfinite(d)
-        if not np.any(valid):
-            return np.nan
-        d_norm = d[valid] / msd
-        w = self.vertex_areas_sub[valid]
-        return self._weighted_entropy_from_normalized_distances(d_norm, w, n_bins=48, lo=0.0, hi=3.0)
-
-    def _local_entropy_from_distances(self, distances_sub, radius):
-        """
-        Local entropy inside the geodesic disk d <= r, using d_norm = d / r.
-        """
-        r = float(radius)
-        if not np.isfinite(r) or r <= 0.0:
-            return np.nan
-        d = np.asarray(distances_sub, dtype=np.float64)
-        interior = np.isfinite(d) & (d <= (r + self.eps))
-        if not np.any(interior):
-            return np.nan
-        d_norm = d[interior] / r
+        xy = xy_all[interior]
         w = self.vertex_areas_sub[interior]
-        return self._weighted_entropy_from_normalized_distances(d_norm, w, n_bins=48, lo=0.0, hi=3.0)
+        wsum = float(np.sum(w))
+        if not np.isfinite(wsum) or wsum <= 0.0:
+            return np.nan
+
+        mean_xy = (xy * w[:, None]).sum(axis=0) / wsum
+        centered = xy - mean_xy
+        cov = (centered[:, :, None] * centered[:, None, :] * w[:, None, None]).sum(axis=0) / wsum
+        eigvals = np.linalg.eigvalsh(cov)
+        if eigvals.shape[0] != 2 or eigvals[1] <= 0.0 or not np.all(np.isfinite(eigvals)):
+            return np.nan
+        ratio = max(0.0, min(1.0, float(eigvals[0] / eigvals[1])))
+        return 1.0 - ratio
+
+    def _disk_anisotropy_from_vertices(self, sub_idx, distances_sub, radius):
+        """
+        Legacy tangent-projection anisotropy helper retained for tests/backcompat.
+
+        This is an extrinsic approximation and returns 1 - lambda_min/lambda_max,
+        so round disks are near 0 and elongated disks approach 1. The production
+        anisotropy metric uses _anisotropy_at_radius with intrinsic log-map
+        coordinates when vector heat is enabled.
+        """
+        r = float(radius)
+        if not np.isfinite(r) or r <= 0.0:
+            return np.nan
+        d = np.asarray(distances_sub, dtype=np.float64)
+        interior = np.isfinite(d) & (d <= r + self.eps)
+        if int(np.sum(interior)) < 3:
+            return np.nan
+
+        e1, e2, _ = self._tangent_frame_at_subvertex(sub_idx)
+        origin = self.vertices[int(sub_idx)]
+        delta = self.vertices[interior] - origin
+        xy = np.column_stack((delta @ e1, delta @ e2))
+        w = self.vertex_areas_sub[interior]
+        wsum = float(np.sum(w))
+        if not np.isfinite(wsum) or wsum <= 0.0:
+            return np.nan
+
+        mean_xy = (xy * w[:, None]).sum(axis=0) / wsum
+        centered = xy - mean_xy
+        cov = (centered[:, :, None] * centered[:, None, :] * w[:, None, None]).sum(axis=0) / wsum
+        eigvals = np.linalg.eigvalsh(cov)
+        if eigvals[1] <= 0.0 or not np.all(np.isfinite(eigvals)):
+            return np.nan
+        ratio = max(0.0, min(1.0, float(eigvals[0] / eigvals[1])))
+        return 1.0 - ratio
+
+    def _ensure_sample_storage_capacity(self, needed_width):
+        """Grow NaN-padded sampled radius/area storage when a row exceeds capacity."""
+        needed_width = int(needed_width)
+        if needed_width <= 0:
+            return
+        if self.sampled_radii is None or self.sampled_areas is None:
+            width = max(needed_width, 1)
+            self.sampled_radii = np.full((self.n_vertices_full, width), np.nan, dtype=np.float32)
+            self.sampled_areas = np.full((self.n_vertices_full, width), np.nan, dtype=np.float32)
+            self.n_samples_per_vertex = np.zeros(self.n_vertices_full, dtype=np.int32)
+            return
+        current = int(self.sampled_radii.shape[1])
+        if needed_width <= current:
+            return
+        new_width = max(needed_width, current * 2)
+        pad = new_width - current
+        self.sampled_radii = np.pad(
+            self.sampled_radii,
+            ((0, 0), (0, pad)),
+            mode="constant",
+            constant_values=np.nan,
+        )
+        self.sampled_areas = np.pad(
+            self.sampled_areas,
+            ((0, 0), (0, pad)),
+            mode="constant",
+            constant_values=np.nan,
+        )
+
+    def _store_vertex_area_samples(self, orig_idx, samples, max_radius=None):
+        """Deduplicate, sort, boundary-filter, and store sampled (radius, area) pairs."""
+        if self.sampled_radii is None or self.sampled_areas is None or self.n_samples_per_vertex is None:
+            self._ensure_sample_storage_capacity(1)
+
+        clean = []
+        for r, a in samples:
+            r_f = float(r)
+            a_f = float(a)
+            if not (np.isfinite(r_f) and np.isfinite(a_f)):
+                continue
+            if r_f < 0.0:
+                continue
+            if max_radius is not None and np.isfinite(max_radius) and r_f > float(max_radius):
+                continue
+            clean.append((r_f, a_f))
+
+        if not clean:
+            self.n_samples_per_vertex[int(orig_idx)] = 0
+            return 0
+
+        clean.sort(key=lambda item: item[0])
+        radii = np.asarray([item[0] for item in clean], dtype=np.float64)
+        total_range = float(np.max(radii) - np.min(radii)) if radii.size else 0.0
+        tol = max(1e-12, 1e-9 * total_range)
+
+        dedup = []
+        for r, a in clean:
+            if dedup and abs(r - dedup[-1][0]) <= tol:
+                dedup[-1] = (r, a)
+            else:
+                dedup.append((r, a))
+
+        n = len(dedup)
+        self._ensure_sample_storage_capacity(n)
+        row = int(orig_idx)
+        self.sampled_radii[row, :] = np.nan
+        self.sampled_areas[row, :] = np.nan
+        if n:
+            self.sampled_radii[row, :n] = np.asarray([x[0] for x in dedup], dtype=np.float32)
+            self.sampled_areas[row, :n] = np.asarray([x[1] for x in dedup], dtype=np.float32)
+        self.n_samples_per_vertex[row] = np.int32(n)
+        return n
 
     def _find_radius_for_area(
         self,
@@ -1239,9 +1364,18 @@ class FastCorticalWiringAnalysis:
         Optional warm-start around r_init plus bracket expansion are used to
         accelerate convergence while preserving exact bisection solving.
         """
+        history = []
+
+        def record(r_val, area_val):
+            r_f = float(r_val)
+            a_f = float(area_val)
+            if np.isfinite(r_f) and np.isfinite(a_f):
+                history.append((r_f, a_f))
+            return a_f
+
         valid = np.isfinite(distances_sub)
         if not np.any(valid):
-            return np.nan, 0
+            return np.nan, 0, history
 
         # Precompute per-face min/max distance if not provided (used for fast face rejection)
         if dmin is None or dmax is None:
@@ -1252,20 +1386,24 @@ class FastCorticalWiringAnalysis:
         # Global maximum reachable distance (used for fallback/upper caps)
         d_global_max = float(np.max(distances_sub[valid]))
         if not np.isfinite(d_global_max) or d_global_max <= 0:
-            return np.nan, 0
+            return np.nan, 0, history
 
         # Quick feasibility check: even at max radius, can we reach target_area?
-        area_at_max = self._area_inside_radius(d_global_max, distances_sub, dmin=dmin, dmax=dmax)
+        area_at_max = record(
+            d_global_max,
+            self._area_inside_radius(d_global_max, distances_sub, dmin=dmin, dmax=dmax),
+        )
         if area_at_max + 1e-12 < target_area:
-            return np.nan, 0  # target too large for this (sub)mesh / disconnected distances
+            return np.nan, 0, history  # target too large for this (sub)mesh / disconnected distances
 
         # Helper to compute area (kept local to avoid attribute lookups in tight loops)
         def area_inside(r):
-            return self._area_inside_radius(r, distances_sub, dmin=dmin, dmax=dmax)
+            return record(r, self._area_inside_radius(r, distances_sub, dmin=dmin, dmax=dmax))
 
         # If target_area is tiny, return ~0
         if target_area <= 0:
-            return 0.0, 0
+            record(0.0, 0.0)
+            return 0.0, 0, history
 
         def clamp_radius(x):
             if x is None:
@@ -1310,7 +1448,7 @@ class FastCorticalWiringAnalysis:
         if r_max <= r_min + 1e-12:
             r_min, r_max = 0.0, d_global_max
 
-        a_min = area_inside(r_min) if r_min > 0 else 0.0
+        a_min = area_inside(r_min) if r_min > 0 else record(0.0, 0.0)
         a_max = area_inside(r_max)
 
         # Symmetric bracket recovery:
@@ -1322,7 +1460,7 @@ class FastCorticalWiringAnalysis:
             if new_r_min >= r_min - 1e-12:
                 break
             r_min = new_r_min
-            a_min = area_inside(r_min) if r_min > 0 else 0.0
+            a_min = area_inside(r_min) if r_min > 0 else record(0.0, 0.0)
             n_contract += 1
 
         # Compute adaptive expansion step size.
@@ -1365,14 +1503,17 @@ class FastCorticalWiringAnalysis:
 
             # Convergence: relative area error
             if abs(a_mid - target_area) / target_area < tol:
-                return r_mid, _bisection_count
+                return r_mid, _bisection_count, history
 
             if a_mid < target_area:
                 r_min = r_mid
             else:
                 r_max = r_mid
 
-        return 0.5 * (r_min + r_max), _bisection_count
+        r_final = 0.5 * (r_min + r_max)
+        if not history or abs(history[-1][0] - r_final) > 0.0:
+            area_inside(r_final)
+        return r_final, _bisection_count, history
 
     def _build_vertex_adjacency(self):
         """
@@ -1427,13 +1568,22 @@ class FastCorticalWiringAnalysis:
     # ========================================================================
 
 
-    def compute_all_wiring_costs(self, compute_msd=True, scale=None, area_tol=0.01, vertex_subset=None):
+    def compute_all_wiring_costs(
+        self,
+        compute_msd=True,
+        scale=None,
+        area_tol=0.01,
+        vertex_subset=None,
+        n_samples_between_scales=10,
+        compute_anisotropy=None,
+        boundary_cap_fraction=0.5,
+    ):
         """
-        Compute all wiring cost metrics (MSD, radius, perimeter, anisotropy, entropy) in a single pass.
+        Compute all wiring cost metrics (MSD, radius, perimeter, anisotropy) in a single pass.
 
         This optimized method iterates through each cortical vertex only once. In each
         iteration, it computes the geodesic distance vector and then calculates all
-        derived metrics (MSD, radius, perimeter, anisotropy, entropy) from that vector before discarding it.
+        derived metrics (MSD, radius, perimeter, anisotropy) from that vector before discarding it.
         This avoids re-computing the expensive geodesic distances in separate loops.
 
         Args:
@@ -1441,11 +1591,33 @@ class FastCorticalWiringAnalysis:
             scale: Single scale or iterable of scales as proportions of total cortical area.
             area_tol (float): Relative tolerance for the area binary search.
             vertex_subset: Optional iterable of original vertex indices to compute.
+            n_samples_between_scales: Number of supplementary log-spaced area samples
+                between adjacent solved target-scale radii. Use 0 for bisection
+                history only; values above ~5 increase storage with diminishing returns.
+            compute_anisotropy: Optional override for log-map anisotropy computation.
+            boundary_cap_fraction: Optional multiplier on distance-to-boundary used
+                to skip supplementary samples near mesh boundaries. Set to None
+                to disable. Converged target-scale samples are always retained.
         """
         scales = self.normalize_scales(scale)
+        n_samples_between_scales = int(n_samples_between_scales)
+        if n_samples_between_scales < 0:
+            raise ValueError("n_samples_between_scales must be >= 0.")
+        if boundary_cap_fraction is None:
+            boundary_cap_value = None
+        else:
+            boundary_cap_value = float(boundary_cap_fraction)
+            if not np.isfinite(boundary_cap_value) or boundary_cap_value < 0.0:
+                raise ValueError("boundary_cap_fraction must be finite and >= 0, or None.")
+        do_anisotropy = self.compute_anisotropy if compute_anisotropy is None else bool(compute_anisotropy)
+        if do_anisotropy and self._vector_heat_solver is None:
+            self._initialize_vector_heat_solver(strict=self.strict_anisotropy)
+
         self.active_scales = scales
+        self.n_samples_between_scales = n_samples_between_scales
+        self.boundary_cap_fraction = boundary_cap_value
         self.msd[:] = np.nan
-        self.global_entropy[:] = np.nan
+        self.dist_to_boundary = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
         self.radius_function = {
             float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
         }
@@ -1455,9 +1627,10 @@ class FastCorticalWiringAnalysis:
         self.anisotropy_function = {
             float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
         }
-        self.local_entropy_function = {
-            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
-        }
+        initial_sample_width = max(1, len(scales) * 80 + max(0, len(scales) - 1) * n_samples_between_scales)
+        self.sampled_radii = np.full((self.n_vertices_full, initial_sample_width), np.nan, dtype=np.float32)
+        self.sampled_areas = np.full((self.n_vertices_full, initial_sample_width), np.nan, dtype=np.float32)
+        self.n_samples_per_vertex = np.zeros(self.n_vertices_full, dtype=np.int32)
 
         print("Computing Mean Separation Distances and Local Wiring Costs...")
 
@@ -1501,9 +1674,9 @@ class FastCorticalWiringAnalysis:
         _t_dminmax  = 0.0
         _t_radius   = 0.0
         _t_perim    = 0.0
-        _t_anis     = 0.0
-        _t_entropy_g = 0.0
-        _t_entropy_l = 0.0
+        _t_logmap   = 0.0
+        _t_anisotropy = 0.0
+        _t_samples  = 0.0
         _n_iters    = 0
         _n_total    = len(order_sub)
 
@@ -1516,7 +1689,20 @@ class FastCorticalWiringAnalysis:
             _dt_geodesic = _time.perf_counter() - _t0
             _t_geodesic += _dt_geodesic
 
+            _t0 = _time.perf_counter()
+            log_map_xy = self._compute_log_map_at_subvertex(sub_idx) if do_anisotropy else None
+            _dt_logmap = _time.perf_counter() - _t0
+            _t_logmap += _dt_logmap
+
             orig_idx = self.sub_to_orig[sub_idx]
+
+            if self.boundary_indices.size:
+                b_dists = d_sub[self.boundary_indices]
+                b_finite = b_dists[np.isfinite(b_dists)]
+                min_b_dist = float(np.min(b_finite)) if b_finite.size else np.nan
+            else:
+                min_b_dist = np.inf
+            self.dist_to_boundary[orig_idx] = np.float32(min_b_dist)
 
             # --- Phase 2: MSD ---
             _t0 = _time.perf_counter()
@@ -1533,13 +1719,6 @@ class FastCorticalWiringAnalysis:
             self.msd[orig_idx] = np.float32(msd_val)
             _dt_msd = _time.perf_counter() - _t0
             _t_msd += _dt_msd
-
-            # --- Phase 2b: global entropy from all distances normalized by MSD ---
-            _t0 = _time.perf_counter()
-            global_entropy_val = self._global_entropy_from_distances(d_sub, msd_val)
-            self.global_entropy[orig_idx] = np.float32(global_entropy_val)
-            _dt_entropy_g = _time.perf_counter() - _t0
-            _t_entropy_g += _dt_entropy_g
 
             # --- Phase 3: dmin/dmax buffers ---
             _t0 = _time.perf_counter()
@@ -1558,9 +1737,9 @@ class FastCorticalWiringAnalysis:
             _is_first_vertex = (_n_iters == 0)
             _dt_radius_iter = 0.0
             _dt_perim_iter = 0.0
-            _dt_anis_iter = 0.0
-            _dt_entropy_l_iter = 0.0
+            _dt_anisotropy_iter = 0.0
             _bisection_iters_by_scale = []
+            _area_samples_for_vertex = []
             for s in scales:
                 scale_key = float(s)
                 r_sub = r_sub_by_scale[scale_key]
@@ -1618,24 +1797,32 @@ class FastCorticalWiringAnalysis:
                         r_euclid=r_euclid_by_scale[scale_key],
                     )
                 if isinstance(_r_out, tuple):
-                    r, _bcount = _r_out
+                    if len(_r_out) >= 3:
+                        r, _bcount, _history = _r_out[:3]
+                    elif len(_r_out) == 2:
+                        r, _bcount = _r_out
+                        _history = []
+                    else:
+                        r, _bcount, _history = _r_out[0], 0, []
                 else:
                     # Compatibility for tests/mocks that still return a scalar radius.
-                    r, _bcount = _r_out, 0
+                    r, _bcount, _history = _r_out, 0, []
                 _dt_radius = _time.perf_counter() - _t0
                 _t_radius += _dt_radius
                 _dt_radius_iter += _dt_radius
+                if _history:
+                    _area_samples_for_vertex.extend(_history)
                 if not np.isfinite(r):
                     _bisection_iters_by_scale.append(0)
                     r_sub[sub_idx] = np.nan
                     self.radius_function[scale_key][orig_idx] = np.nan
                     self.perimeter_function[scale_key][orig_idx] = np.nan
                     self.anisotropy_function[scale_key][orig_idx] = np.nan
-                    self.local_entropy_function[scale_key][orig_idx] = np.nan
                     continue
 
                 _bisection_iters_by_scale.append(int(_bcount))
                 r_prev_scale = float(r)
+                _area_samples_for_vertex.append((float(r), float(target_areas[scale_key])))
 
                 _t0 = _time.perf_counter()
                 perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
@@ -1644,64 +1831,111 @@ class FastCorticalWiringAnalysis:
                 _dt_perim_iter += _dt_perim
 
                 _t0 = _time.perf_counter()
-                anis = self._disk_anisotropy_from_vertices(sub_idx, d_sub, r)
+                if log_map_xy is not None:
+                    anisotropy_val = self._anisotropy_at_radius(log_map_xy, d_sub, r)
+                elif do_anisotropy:
+                    anisotropy_val = np.nan
+                else:
+                    anisotropy_val = self._disk_anisotropy_from_vertices(sub_idx, d_sub, r)
                 _dt_anis = _time.perf_counter() - _t0
-                _t_anis += _dt_anis
-                _dt_anis_iter += _dt_anis
-
-                _t0 = _time.perf_counter()
-                local_entropy = self._local_entropy_from_distances(d_sub, r)
-                _dt_entropy_l = _time.perf_counter() - _t0
-                _t_entropy_l += _dt_entropy_l
-                _dt_entropy_l_iter += _dt_entropy_l
+                _t_anisotropy += _dt_anis
+                _dt_anisotropy_iter += _dt_anis
                 r_sub[sub_idx] = np.float32(r)
                 self.radius_function[scale_key][orig_idx] = np.float32(r)
                 self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
-                self.anisotropy_function[scale_key][orig_idx] = np.float32(anis)
-                self.local_entropy_function[scale_key][orig_idx] = np.float32(local_entropy)
+                self.anisotropy_function[scale_key][orig_idx] = np.float32(anisotropy_val)
+
+            _t0 = _time.perf_counter()
+            if boundary_cap_value is not None and np.isfinite(self.dist_to_boundary[orig_idx]):
+                boundary_cap = boundary_cap_value * float(self.dist_to_boundary[orig_idx])
+            else:
+                boundary_cap = np.inf
+            if n_samples_between_scales > 0:
+                solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
+                for i in range(len(solved_radii_for_vertex) - 1):
+                    r_lo = solved_radii_for_vertex[i]
+                    r_hi = solved_radii_for_vertex[i + 1]
+                    if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_hi > r_lo and r_lo > 0.0):
+                        continue
+                    extra_rs = np.exp(
+                        np.linspace(
+                            np.log(r_lo),
+                            np.log(r_hi),
+                            n_samples_between_scales + 2,
+                        )
+                    )[1:-1]
+                    for r_extra in extra_rs:
+                        if float(r_extra) > boundary_cap:
+                            continue
+                        a_extra = self._area_inside_radius(
+                            float(r_extra),
+                            d_sub,
+                            dmin=self._dmin_buf,
+                            dmax=self._dmax_buf,
+                        )
+                        _area_samples_for_vertex.append((float(r_extra), float(a_extra)))
+
+            self._store_vertex_area_samples(orig_idx, _area_samples_for_vertex, max_radius=None)
+            _dt_samples_iter = _time.perf_counter() - _t0
+            _t_samples += _dt_samples_iter
 
             _n_iters += 1
             _dt_total_iter = (
                 _dt_geodesic
+                + _dt_logmap
                 + _dt_msd
-                + _dt_entropy_g
                 + _dt_dminmax
                 + _dt_radius_iter
                 + _dt_perim_iter
-                + _dt_anis_iter
-                + _dt_entropy_l_iter
+                + _dt_anisotropy_iter
+                + _dt_samples_iter
             )
             tqdm.write(
                 f"[{_n_iters}/{_n_total}] "
                 f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
+                f"log_map={1000.0 * _dt_logmap:.2f}ms "
                 f"msd={1000.0 * _dt_msd:.2f}ms "
-                f"global_entropy={1000.0 * _dt_entropy_g:.2f}ms "
                 f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
                 f"radius={1000.0 * _dt_radius_iter:.2f}ms "
                 f"perim={1000.0 * _dt_perim_iter:.2f}ms "
-                f"anis={1000.0 * _dt_anis_iter:.2f}ms "
-                f"local_entropy={1000.0 * _dt_entropy_l_iter:.2f}ms "
+                f"anisotropy={1000.0 * _dt_anisotropy_iter:.2f}ms "
+                f"samples={1000.0 * _dt_samples_iter:.2f}ms "
                 f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
                 f"total={1000.0 * _dt_total_iter:.2f}ms"
             )
 
-        _t_total = _t_geodesic + _t_msd + _t_entropy_g + _t_dminmax + _t_radius + _t_perim + _t_anis + _t_entropy_l
+        if self.n_samples_per_vertex is not None and self.sampled_radii is not None:
+            max_used = int(np.max(self.n_samples_per_vertex)) if self.n_samples_per_vertex.size else 0
+            final_width = max(1, max_used)
+            self.sampled_radii = self.sampled_radii[:, :final_width]
+            self.sampled_areas = self.sampled_areas[:, :final_width]
+
+        _t_total = (
+            _t_geodesic
+            + _t_logmap
+            + _t_msd
+            + _t_dminmax
+            + _t_radius
+            + _t_perim
+            + _t_anisotropy
+            + _t_samples
+        )
         if _t_total > 0 and _n_iters > 0:
             _per = lambda t: f"{t:.1f}s ({100.0 * t / _t_total:.1f}%)"
             _timing_lines = [
                 f"Timing breakdown over {_n_iters} vertices:",
                 f"  geodesic solve : {_per(_t_geodesic)}",
+                f"  log map        : {_per(_t_logmap)}",
                 f"  MSD            : {_per(_t_msd)}",
-                f"  global entropy : {_per(_t_entropy_g)}",
                 f"  dmin/dmax      : {_per(_t_dminmax)}",
                 f"  radius bisect  : {_per(_t_radius)}  [{len(scales)} scales]",
                 f"  perimeter      : {_per(_t_perim)}  [{len(scales)} scales]",
-                f"  anisotropy     : {_per(_t_anis)}  [{len(scales)} scales]",
-                f"  local entropy  : {_per(_t_entropy_l)}  [{len(scales)} scales]",
+                f"  anisotropy     : {_per(_t_anisotropy)}  [{len(scales)} scales]",
+                f"  samples        : {_per(_t_samples)}",
                 f"  total          : {_t_total:.1f}s",
                 f"  per vertex     : {1000.0 * _t_total / _n_iters:.2f} ms/vertex",
                 f"  geodesic frac  : {100.0 * _t_geodesic / _t_total:.1f}%",
-                f"  geometry frac  : {100.0 * (_t_msd + _t_entropy_g + _t_dminmax + _t_radius + _t_perim + _t_anis + _t_entropy_l) / _t_total:.1f}%",
+                f"  geometry frac  : {100.0 * (_t_msd + _t_dminmax + _t_radius + _t_perim + _t_anisotropy + _t_samples) / _t_total:.1f}%",
             ]
             for line in _timing_lines:
                 print(line)
@@ -1710,19 +1944,12 @@ class FastCorticalWiringAnalysis:
         valid_msd = self.msd[np.isfinite(self.msd)]
         if valid_msd.size:
             print(f"MSD stats: min={np.min(valid_msd):.2f}, max={np.max(valid_msd):.2f}, mean={np.mean(valid_msd):.2f}")
-        vge = self.global_entropy[np.isfinite(self.global_entropy)]
-        if vge.size:
-            print(
-                f"Global entropy stats: "
-                f"min={np.min(vge):.3f}, max={np.max(vge):.3f}, mean={np.mean(vge):.3f}"
-            )
 
         for s in scales:
             scale_key = float(s)
             vr = self.radius_function[scale_key][np.isfinite(self.radius_function[scale_key])]
             vp = self.perimeter_function[scale_key][np.isfinite(self.perimeter_function[scale_key])]
             va = self.anisotropy_function[scale_key][np.isfinite(self.anisotropy_function[scale_key])]
-            vle = self.local_entropy_function[scale_key][np.isfinite(self.local_entropy_function[scale_key])]
             if vr.size:
                 print(
                     f"Radius stats @ {s*100:.2f}%: "
@@ -1738,11 +1965,6 @@ class FastCorticalWiringAnalysis:
                     f"Anisotropy stats @ {s*100:.2f}%: "
                     f"min={np.min(va):.3f}, max={np.max(va):.3f}, mean={np.mean(va):.3f}"
                 )
-            if vle.size:
-                print(
-                    f"Local entropy stats @ {s*100:.2f}%: "
-                    f"min={np.min(vle):.3f}, max={np.max(vle):.3f}, mean={np.mean(vle):.3f}"
-                )
 
         return self.msd, self.radius_function, self.perimeter_function
             
@@ -1751,13 +1973,15 @@ class FastCorticalWiringAnalysis:
     # ========================================================================
     
     def get_metric_arrays(self):
-        """Return computed metric arrays in a standard mapping."""
-        out = {"msd": self.msd, "global_entropy": self.global_entropy}
+        """Return computed scalar metric arrays; sampled radius/area pairs are saved separately."""
+        out = {
+            "msd": self.msd,
+            "dist_to_boundary": self.dist_to_boundary,
+        }
         for scale in self.active_scales:
             scale_key = float(scale)
             token = self.scale_token(scale_key)
             out[f"radius_{token}"] = self.radius_function[scale_key]
             out[f"perimeter_{token}"] = self.perimeter_function[scale_key]
             out[f"anisotropy_{token}"] = self.anisotropy_function[scale_key]
-            out[f"local_entropy_{token}"] = self.local_entropy_function[scale_key]
         return out
