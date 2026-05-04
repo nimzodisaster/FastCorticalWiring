@@ -228,6 +228,7 @@ def build_fastcw_cmd(args, subject):
     if args.output_dir: cmd.extend(["--output-dir", args.output_dir])
     if args.output_format: cmd.extend(["--output-format", args.output_format])
     if args.engine: cmd.extend(["--engine", args.engine])
+    if args.batch_size is not None: cmd.extend(["--batch-size", str(args.batch_size)])
     if args.sample is not None:
         cmd.extend(["--sample", str(args.sample)])
         if args.sample_kind is not None:
@@ -288,6 +289,7 @@ def main():
     )
     parser.add_argument("--output-format", default=None, help="Optional FastCW output format override")
     parser.add_argument("--engine", default=None, help="Optional FastCW geodesic engine")
+    parser.add_argument("--batch-size", type=int, default=None, help="Optional FastCW geodesic batch size")
     parser.add_argument(
         "--force-logical",
         action="store_true",

@@ -930,6 +930,27 @@ class FastCorticalWiringAnalysis:
         d = self.distance_engine.compute_distance(int(sub_idx))
         return np.ascontiguousarray(d, dtype=np.float64)
 
+    def _compute_geodesic_distance_batch_from_subvertices(self, sub_indices):
+        """
+        Compute geodesic distances from multiple submesh vertices.
+
+        Returns an array with shape (n_submesh_vertices, n_sources).
+        """
+        sources = np.asarray(list(sub_indices), dtype=np.int64).reshape(-1)
+        if sources.size == 0:
+            return np.empty((self.n_vertices, 0), dtype=np.float64)
+        if getattr(self.distance_engine, "supports_batching", False):
+            d_batch = self.distance_engine.compute_distance_batch(sources)
+        else:
+            d_batch = np.column_stack(
+                [self.distance_engine.compute_distance(int(src)) for src in sources]
+            )
+        d_batch = np.asarray(d_batch, dtype=np.float64)
+        expected = (self.n_vertices, int(sources.size))
+        if d_batch.shape != expected:
+            raise ValueError(f"Geodesic batch returned shape {d_batch.shape}; expected {expected}.")
+        return np.ascontiguousarray(d_batch, dtype=np.float64)
+
     def compute_geodesic_distances_from_vertex(self, source_idx):
         """
         Public interface for computing geodesic distances from any original vertex index.
@@ -1588,6 +1609,7 @@ class FastCorticalWiringAnalysis:
         n_samples_between_scales=10,
         compute_anisotropy=None,
         boundary_cap_fraction=0.5,
+        batch_size=32,
     ):
         """
         Compute all wiring cost metrics (MSD, radius, perimeter, anisotropy) in a single pass.
@@ -1609,8 +1631,13 @@ class FastCorticalWiringAnalysis:
             boundary_cap_fraction: Optional multiplier on distance-to-boundary used
                 to skip supplementary samples near mesh boundaries. Set to None
                 to disable. Converged target-scale samples are always retained.
+            batch_size: Number of source vertices per geodesic batch. Values <= 1
+                force single-source batches.
         """
         scales = self.normalize_scales(scale)
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer.")
         n_samples_between_scales = int(n_samples_between_scales)
         if n_samples_between_scales < 0:
             raise ValueError("n_samples_between_scales must be >= 0.")
@@ -1690,230 +1717,244 @@ class FastCorticalWiringAnalysis:
         _t_samples  = 0.0
         _n_iters    = 0
         _n_total    = len(order_sub)
+        _n_batches  = 0
+        _sum_batch_width = 0
 
-        # Single loop over all cortical vertices (BFS order for warm-start locality)
-        for sub_idx in tqdm(order_sub, desc="Computing wiring costs"):
-
-            # --- Phase 1: Geodesic solve ---
-            _t0 = _time.perf_counter()
-            d_sub = self._compute_geodesic_distances_from_subvertex(sub_idx)
-            _dt_geodesic = _time.perf_counter() - _t0
-            _t_geodesic += _dt_geodesic
-
-            _t0 = _time.perf_counter()
-            log_map_xy = self._compute_log_map_at_subvertex(sub_idx) if do_anisotropy else None
-            _dt_logmap = _time.perf_counter() - _t0
-            _t_logmap += _dt_logmap
-
-            orig_idx = self.sub_to_orig[sub_idx]
-
-            if self.boundary_indices.size:
-                b_dists = d_sub[self.boundary_indices]
-                b_finite = b_dists[np.isfinite(b_dists)]
-                min_b_dist = float(np.min(b_finite)) if b_finite.size else np.nan
-            else:
-                min_b_dist = np.inf
-            self.dist_to_boundary[orig_idx] = np.float32(min_b_dist)
-
-            # --- Phase 2: MSD ---
-            _t0 = _time.perf_counter()
-            valid = (d_sub > self.eps) & np.isfinite(d_sub)
-            if np.any(valid):
-                w = self.vertex_areas_sub[valid]
-                wsum = float(np.sum(w))
-                if np.isfinite(wsum) and wsum > 0.0:
-                    msd_val = float((d_sub[valid] * w).sum() / wsum)
-                else:
-                    msd_val = np.nan
-            else:
-                msd_val = np.nan
-            self.msd[orig_idx] = np.float32(msd_val)
-            _dt_msd = _time.perf_counter() - _t0
-            _t_msd += _dt_msd
-
-            # --- Phase 3: dmin/dmax buffers ---
-            _t0 = _time.perf_counter()
-            np.take(d_sub, self._f0, out=self._d0_buf)
-            np.take(d_sub, self._f1, out=self._d1_buf)
-            np.take(d_sub, self._f2, out=self._d2_buf)
-            np.minimum(self._d0_buf, self._d1_buf, out=self._dmin_buf)
-            np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
-            np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
-            np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
-            _dt_dminmax = _time.perf_counter() - _t0
-            _t_dminmax += _dt_dminmax
-
-            # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
-            r_prev_scale = np.nan
-            _is_first_vertex = (_n_iters == 0)
-            _dt_radius_iter = 0.0
-            _dt_perim_iter = 0.0
-            _dt_anisotropy_iter = 0.0
-            _bisection_iters_by_scale = []
-            _area_samples_for_vertex = []
-            for s in scales:
-                scale_key = float(s)
-                r_sub = r_sub_by_scale[scale_key]
-                solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
-
-                neighbor_lower = None
-                neighbor_upper = None
-                if solved_neighbor_r:
-                    neighbors = np.asarray(solved_neighbor_r, dtype=np.float64)
-                    neighbor_eps = max(self.eps * 10.0, 1e-6)
-                    neighbor_lower = max(0.0, float(np.min(neighbors)) - neighbor_eps)
-                    neighbor_upper = float(np.max(neighbors)) + neighbor_eps
-                    r_init = 0.5 * (neighbor_lower + neighbor_upper)
-                    _neighbor_range = float(np.max(neighbors)) - float(np.min(neighbors))
-                else:
-                    r_init = r_euclid_by_scale[scale_key]
-                    _neighbor_range = 0.0
-
-                if np.isfinite(r_prev_scale):
-                    if neighbor_lower is None:
-                        r_lower = float(r_prev_scale)
-                    else:
-                        r_lower = max(neighbor_lower, float(r_prev_scale))
-                else:
-                    r_lower = neighbor_lower
-                r_upper = neighbor_upper
-
-                _t0 = _time.perf_counter()
-                if _is_first_vertex:
-                    _cold_r_euclid = r_euclid_by_scale[scale_key]
-                    _cold_delta0 = 0.4 * _cold_r_euclid
-                    _r_out = self._find_radius_for_area(
-                        d_sub,
-                        target_areas[scale_key],
-                        tol=area_tol,
-                        dmin=self._dmin_buf,
-                        dmax=self._dmax_buf,
-                        r_init=_cold_r_euclid,
-                        r_lower=max(0.0, _cold_r_euclid - _cold_delta0),
-                        r_upper=_cold_r_euclid + _cold_delta0,
-                        delta0=_cold_delta0,
-                        max_iter=50,
-                    )
-                else:
-                    _r_out = self._find_radius_for_area(
-                        d_sub,
-                        target_areas[scale_key],
-                        tol=area_tol,
-                        dmin=self._dmin_buf,
-                        dmax=self._dmax_buf,
-                        r_init=r_init,
-                        r_lower=r_lower,
-                        r_upper=r_upper,
-                        neighbor_range=_neighbor_range,
-                        r_euclid=r_euclid_by_scale[scale_key],
-                    )
-                if isinstance(_r_out, tuple):
-                    if len(_r_out) >= 3:
-                        r, _bcount, _history = _r_out[:3]
-                    elif len(_r_out) == 2:
-                        r, _bcount = _r_out
-                        _history = []
-                    else:
-                        r, _bcount, _history = _r_out[0], 0, []
-                else:
-                    # Compatibility for tests/mocks that still return a scalar radius.
-                    r, _bcount, _history = _r_out, 0, []
-                _dt_radius = _time.perf_counter() - _t0
-                _t_radius += _dt_radius
-                _dt_radius_iter += _dt_radius
-                if _history:
-                    _area_samples_for_vertex.extend(_history)
-                if not np.isfinite(r):
-                    _bisection_iters_by_scale.append(0)
-                    r_sub[sub_idx] = np.nan
-                    self.radius_function[scale_key][orig_idx] = np.nan
-                    self.perimeter_function[scale_key][orig_idx] = np.nan
-                    self.anisotropy_function[scale_key][orig_idx] = np.nan
+        # Batched geodesic loop over cortical vertices (BFS order for warm-start locality).
+        with tqdm(total=_n_total, desc="Computing wiring costs") as _pbar:
+            for batch_start in range(0, _n_total, batch_size):
+                batch_indices = order_sub[batch_start : batch_start + batch_size]
+                if not batch_indices:
                     continue
+                _n_batches += 1
+                _sum_batch_width += len(batch_indices)
 
-                _bisection_iters_by_scale.append(int(_bcount))
-                r_prev_scale = float(r)
-                _area_samples_for_vertex.append((float(r), float(target_areas[scale_key])))
-
+                # --- Phase 1: Geodesic solve for this batch ---
                 _t0 = _time.perf_counter()
-                perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
-                _dt_perim = _time.perf_counter() - _t0
-                _t_perim += _dt_perim
-                _dt_perim_iter += _dt_perim
+                d_batch = self._compute_geodesic_distance_batch_from_subvertices(batch_indices)
+                _dt_geodesic_batch = _time.perf_counter() - _t0
+                _t_geodesic += _dt_geodesic_batch
+                _dt_geodesic_per_source = _dt_geodesic_batch / float(len(batch_indices))
 
-                _t0 = _time.perf_counter()
-                if log_map_xy is not None:
-                    anisotropy_val = self._anisotropy_at_radius(log_map_xy, d_sub, r)
-                elif do_anisotropy:
-                    anisotropy_val = np.nan
-                else:
-                    anisotropy_val = self._disk_anisotropy_from_vertices(sub_idx, d_sub, r)
-                _dt_anis = _time.perf_counter() - _t0
-                _t_anisotropy += _dt_anis
-                _dt_anisotropy_iter += _dt_anis
-                r_sub[sub_idx] = np.float32(r)
-                self.radius_function[scale_key][orig_idx] = np.float32(r)
-                self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
-                self.anisotropy_function[scale_key][orig_idx] = np.float32(anisotropy_val)
+                for batch_col, sub_idx in enumerate(batch_indices):
+                    d_sub = np.ascontiguousarray(d_batch[:, batch_col], dtype=np.float64)
+                    _dt_geodesic = _dt_geodesic_per_source
 
-            _t0 = _time.perf_counter()
-            if boundary_cap_value is not None and np.isfinite(self.dist_to_boundary[orig_idx]):
-                boundary_cap = boundary_cap_value * float(self.dist_to_boundary[orig_idx])
-            else:
-                boundary_cap = np.inf
-            if n_samples_between_scales > 0:
-                solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
-                for i in range(len(solved_radii_for_vertex) - 1):
-                    r_lo = solved_radii_for_vertex[i]
-                    r_hi = solved_radii_for_vertex[i + 1]
-                    if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_hi > r_lo and r_lo > 0.0):
-                        continue
-                    extra_rs = np.exp(
-                        np.linspace(
-                            np.log(r_lo),
-                            np.log(r_hi),
-                            n_samples_between_scales + 2,
-                        )
-                    )[1:-1]
-                    for r_extra in extra_rs:
-                        if float(r_extra) > boundary_cap:
+                    _t0 = _time.perf_counter()
+                    log_map_xy = self._compute_log_map_at_subvertex(sub_idx) if do_anisotropy else None
+                    _dt_logmap = _time.perf_counter() - _t0
+                    _t_logmap += _dt_logmap
+
+                    orig_idx = self.sub_to_orig[sub_idx]
+
+                    if self.boundary_indices.size:
+                        b_dists = d_sub[self.boundary_indices]
+                        b_finite = b_dists[np.isfinite(b_dists)]
+                        min_b_dist = float(np.min(b_finite)) if b_finite.size else np.nan
+                    else:
+                        min_b_dist = np.inf
+                    self.dist_to_boundary[orig_idx] = np.float32(min_b_dist)
+
+                    # --- Phase 2: MSD ---
+                    _t0 = _time.perf_counter()
+                    valid = (d_sub > self.eps) & np.isfinite(d_sub)
+                    if np.any(valid):
+                        w = self.vertex_areas_sub[valid]
+                        wsum = float(np.sum(w))
+                        if np.isfinite(wsum) and wsum > 0.0:
+                            msd_val = float((d_sub[valid] * w).sum() / wsum)
+                        else:
+                            msd_val = np.nan
+                    else:
+                        msd_val = np.nan
+                    self.msd[orig_idx] = np.float32(msd_val)
+                    _dt_msd = _time.perf_counter() - _t0
+                    _t_msd += _dt_msd
+
+                    # --- Phase 3: dmin/dmax buffers ---
+                    _t0 = _time.perf_counter()
+                    np.take(d_sub, self._f0, out=self._d0_buf)
+                    np.take(d_sub, self._f1, out=self._d1_buf)
+                    np.take(d_sub, self._f2, out=self._d2_buf)
+                    np.minimum(self._d0_buf, self._d1_buf, out=self._dmin_buf)
+                    np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
+                    np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
+                    np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
+                    _dt_dminmax = _time.perf_counter() - _t0
+                    _t_dminmax += _dt_dminmax
+
+                    # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
+                    r_prev_scale = np.nan
+                    _is_first_vertex = (_n_iters == 0)
+                    _dt_radius_iter = 0.0
+                    _dt_perim_iter = 0.0
+                    _dt_anisotropy_iter = 0.0
+                    _bisection_iters_by_scale = []
+                    _area_samples_for_vertex = []
+                    for s in scales:
+                        scale_key = float(s)
+                        r_sub = r_sub_by_scale[scale_key]
+                        solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
+
+                        neighbor_lower = None
+                        neighbor_upper = None
+                        if solved_neighbor_r:
+                            neighbors = np.asarray(solved_neighbor_r, dtype=np.float64)
+                            neighbor_eps = max(self.eps * 10.0, 1e-6)
+                            neighbor_lower = max(0.0, float(np.min(neighbors)) - neighbor_eps)
+                            neighbor_upper = float(np.max(neighbors)) + neighbor_eps
+                            r_init = 0.5 * (neighbor_lower + neighbor_upper)
+                            _neighbor_range = float(np.max(neighbors)) - float(np.min(neighbors))
+                        else:
+                            r_init = r_euclid_by_scale[scale_key]
+                            _neighbor_range = 0.0
+
+                        if np.isfinite(r_prev_scale):
+                            if neighbor_lower is None:
+                                r_lower = float(r_prev_scale)
+                            else:
+                                r_lower = max(neighbor_lower, float(r_prev_scale))
+                        else:
+                            r_lower = neighbor_lower
+                        r_upper = neighbor_upper
+
+                        _t0 = _time.perf_counter()
+                        if _is_first_vertex:
+                            _cold_r_euclid = r_euclid_by_scale[scale_key]
+                            _cold_delta0 = 0.4 * _cold_r_euclid
+                            _r_out = self._find_radius_for_area(
+                                d_sub,
+                                target_areas[scale_key],
+                                tol=area_tol,
+                                dmin=self._dmin_buf,
+                                dmax=self._dmax_buf,
+                                r_init=_cold_r_euclid,
+                                r_lower=max(0.0, _cold_r_euclid - _cold_delta0),
+                                r_upper=_cold_r_euclid + _cold_delta0,
+                                delta0=_cold_delta0,
+                                max_iter=50,
+                            )
+                        else:
+                            _r_out = self._find_radius_for_area(
+                                d_sub,
+                                target_areas[scale_key],
+                                tol=area_tol,
+                                dmin=self._dmin_buf,
+                                dmax=self._dmax_buf,
+                                r_init=r_init,
+                                r_lower=r_lower,
+                                r_upper=r_upper,
+                                neighbor_range=_neighbor_range,
+                                r_euclid=r_euclid_by_scale[scale_key],
+                            )
+                        if isinstance(_r_out, tuple):
+                            if len(_r_out) >= 3:
+                                r, _bcount, _history = _r_out[:3]
+                            elif len(_r_out) == 2:
+                                r, _bcount = _r_out
+                                _history = []
+                            else:
+                                r, _bcount, _history = _r_out[0], 0, []
+                        else:
+                            # Compatibility for tests/mocks that still return a scalar radius.
+                            r, _bcount, _history = _r_out, 0, []
+                        _dt_radius = _time.perf_counter() - _t0
+                        _t_radius += _dt_radius
+                        _dt_radius_iter += _dt_radius
+                        if _history:
+                            _area_samples_for_vertex.extend(_history)
+                        if not np.isfinite(r):
+                            _bisection_iters_by_scale.append(0)
+                            r_sub[sub_idx] = np.nan
+                            self.radius_function[scale_key][orig_idx] = np.nan
+                            self.perimeter_function[scale_key][orig_idx] = np.nan
+                            self.anisotropy_function[scale_key][orig_idx] = np.nan
                             continue
-                        a_extra = self._area_inside_radius(
-                            float(r_extra),
-                            d_sub,
-                            dmin=self._dmin_buf,
-                            dmax=self._dmax_buf,
-                        )
-                        _area_samples_for_vertex.append((float(r_extra), float(a_extra)))
 
-            self._store_vertex_area_samples(orig_idx, _area_samples_for_vertex, max_radius=None)
-            _dt_samples_iter = _time.perf_counter() - _t0
-            _t_samples += _dt_samples_iter
+                        _bisection_iters_by_scale.append(int(_bcount))
+                        r_prev_scale = float(r)
+                        _area_samples_for_vertex.append((float(r), float(target_areas[scale_key])))
 
-            _n_iters += 1
-            _dt_total_iter = (
-                _dt_geodesic
-                + _dt_logmap
-                + _dt_msd
-                + _dt_dminmax
-                + _dt_radius_iter
-                + _dt_perim_iter
-                + _dt_anisotropy_iter
-                + _dt_samples_iter
-            )
-            tqdm.write(
-                f"[{_n_iters}/{_n_total}] "
-                f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
-                f"log_map={1000.0 * _dt_logmap:.2f}ms "
-                f"msd={1000.0 * _dt_msd:.2f}ms "
-                f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
-                f"radius={1000.0 * _dt_radius_iter:.2f}ms "
-                f"perim={1000.0 * _dt_perim_iter:.2f}ms "
-                f"anisotropy={1000.0 * _dt_anisotropy_iter:.2f}ms "
-                f"samples={1000.0 * _dt_samples_iter:.2f}ms "
-                f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
-                f"total={1000.0 * _dt_total_iter:.2f}ms"
-            )
+                        _t0 = _time.perf_counter()
+                        perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
+                        _dt_perim = _time.perf_counter() - _t0
+                        _t_perim += _dt_perim
+                        _dt_perim_iter += _dt_perim
+
+                        _t0 = _time.perf_counter()
+                        if log_map_xy is not None:
+                            anisotropy_val = self._anisotropy_at_radius(log_map_xy, d_sub, r)
+                        elif do_anisotropy:
+                            anisotropy_val = np.nan
+                        else:
+                            anisotropy_val = self._disk_anisotropy_from_vertices(sub_idx, d_sub, r)
+                        _dt_anis = _time.perf_counter() - _t0
+                        _t_anisotropy += _dt_anis
+                        _dt_anisotropy_iter += _dt_anis
+                        r_sub[sub_idx] = np.float32(r)
+                        self.radius_function[scale_key][orig_idx] = np.float32(r)
+                        self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
+                        self.anisotropy_function[scale_key][orig_idx] = np.float32(anisotropy_val)
+
+                    _t0 = _time.perf_counter()
+                    if boundary_cap_value is not None and np.isfinite(self.dist_to_boundary[orig_idx]):
+                        boundary_cap = boundary_cap_value * float(self.dist_to_boundary[orig_idx])
+                    else:
+                        boundary_cap = np.inf
+                    if n_samples_between_scales > 0:
+                        solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
+                        for i in range(len(solved_radii_for_vertex) - 1):
+                            r_lo = solved_radii_for_vertex[i]
+                            r_hi = solved_radii_for_vertex[i + 1]
+                            if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_hi > r_lo and r_lo > 0.0):
+                                continue
+                            extra_rs = np.exp(
+                                np.linspace(
+                                    np.log(r_lo),
+                                    np.log(r_hi),
+                                    n_samples_between_scales + 2,
+                                )
+                            )[1:-1]
+                            for r_extra in extra_rs:
+                                if float(r_extra) > boundary_cap:
+                                    continue
+                                a_extra = self._area_inside_radius(
+                                    float(r_extra),
+                                    d_sub,
+                                    dmin=self._dmin_buf,
+                                    dmax=self._dmax_buf,
+                                )
+                                _area_samples_for_vertex.append((float(r_extra), float(a_extra)))
+
+                    self._store_vertex_area_samples(orig_idx, _area_samples_for_vertex, max_radius=None)
+                    _dt_samples_iter = _time.perf_counter() - _t0
+                    _t_samples += _dt_samples_iter
+
+                    _n_iters += 1
+                    _dt_total_iter = (
+                        _dt_geodesic
+                        + _dt_logmap
+                        + _dt_msd
+                        + _dt_dminmax
+                        + _dt_radius_iter
+                        + _dt_perim_iter
+                        + _dt_anisotropy_iter
+                        + _dt_samples_iter
+                    )
+                    tqdm.write(
+                        f"[{_n_iters}/{_n_total}] "
+                        f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
+                        f"log_map={1000.0 * _dt_logmap:.2f}ms "
+                        f"msd={1000.0 * _dt_msd:.2f}ms "
+                        f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
+                        f"radius={1000.0 * _dt_radius_iter:.2f}ms "
+                        f"perim={1000.0 * _dt_perim_iter:.2f}ms "
+                        f"anisotropy={1000.0 * _dt_anisotropy_iter:.2f}ms "
+                        f"samples={1000.0 * _dt_samples_iter:.2f}ms "
+                        f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
+                        f"total={1000.0 * _dt_total_iter:.2f}ms"
+                    )
+                    _pbar.update(1)
 
         if self.n_samples_per_vertex is not None and self.sampled_radii is not None:
             max_used = int(np.max(self.n_samples_per_vertex)) if self.n_samples_per_vertex.size else 0
@@ -1933,9 +1974,11 @@ class FastCorticalWiringAnalysis:
         )
         if _t_total > 0 and _n_iters > 0:
             _per = lambda t: f"{t:.1f}s ({100.0 * t / _t_total:.1f}%)"
+            _avg_batch_width = (_sum_batch_width / _n_batches) if _n_batches else 0.0
             _timing_lines = [
                 f"Timing breakdown over {_n_iters} vertices:",
                 f"  geodesic solve : {_per(_t_geodesic)}",
+                f"  geodesic batch : avg K={_avg_batch_width:.1f}, {1000.0 * _t_geodesic / _n_iters:.2f} ms/vertex",
                 f"  log map        : {_per(_t_logmap)}",
                 f"  MSD            : {_per(_t_msd)}",
                 f"  dmin/dmax      : {_per(_t_dminmax)}",

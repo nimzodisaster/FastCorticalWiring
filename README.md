@@ -6,9 +6,9 @@ High-performance Python tools for computing intrinsic cortical wiring metrics fr
 
 ---
 
-## Important: potpourri3d Build Prerequisites
+## Important: SuiteSparse/CHOLMOD Build Prerequisites
 
-`potpourri3d` performs best when built against SuiteSparse. Install build prerequisites before installing Python dependencies:
+`potpourri3d` performs best when built against SuiteSparse, and the `batch_heat` engine requires CHOLMOD through `scikit-sparse`. Install build prerequisites before installing Python dependencies:
 
 - macOS (Homebrew): `brew install suitesparse`
 - Ubuntu/Debian: `apt-get install cmake libsuitesparse-dev`
@@ -67,6 +67,7 @@ These metrics provide quantitative descriptions of cortical spatial organization
 Uses pluggable geodesic backends:
 
 * `potpourri3d` (primary backend, recommended)
+* `batch_heat` (batched heat-method backend using robust-laplacian + CHOLMOD)
 * `pygeodesic` (exact discrete-geodesic reference backend)
 * `pycortex` (alternate backend)
 
@@ -181,9 +182,11 @@ matplotlib
 tqdm
 pycortex
 pygeodesic
+robust-laplacian
+scikit-sparse<0.5
 ```
 
-For best performance, build potpourri3d locally with SuiteSparse.
+For best performance, build potpourri3d locally with SuiteSparse. The `batch_heat` backend also needs SuiteSparse/CHOLMOD headers available when installing `scikit-sparse<0.5`; the 0.5+ API requires newer SuiteSparse than many system packages provide.
 
 ---
 
@@ -203,7 +206,8 @@ Common options:
 --custom-label cortex
 --scale 0.002 0.00267988 ... 0.05
 --area-tol 0.01
---engine potpourri|pygeodesic|pycortex
+--engine potpourri|batch_heat|pygeodesic|pycortex
+--batch-size 32
 --n-samples-between-scales 3
 --boundary-cap-fraction 0.5
 --compute-anisotropy

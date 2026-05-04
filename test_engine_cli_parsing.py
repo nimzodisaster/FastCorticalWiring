@@ -17,14 +17,48 @@ class EngineCliParsingTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         text = proc.stdout + proc.stderr
         self.assertIn("--engine {potpourri,potpourri_fmm,pycortex,pygeodesic}", text)
+        self.assertNotIn("batch_heat", text)
         self.assertNotIn("{potpourri,legacy,pygeodesic}", text)
         self.assertNotIn("--visualize", text)
         self.assertIn("--scale SCALE [SCALE ...]", text)
         self.assertIn("--allow-eigen-fallback", text)
+        self.assertIn("--batch-size", text)
 
     def test_engine_pycortex_is_accepted_by_parser(self):
         proc = subprocess.run(
             [sys.executable, "fastcw.py", "--engine", "pycortex", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
+
+    def test_engine_batch_heat_warns_when_invoked_for_real_run(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "fastcw.py",
+                "--engine",
+                "batch_heat",
+                "--batch-size",
+                "8",
+                "--output-label",
+                "test",
+                "subjects_dir",
+                "subject_id",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        text = proc.stdout + proc.stderr
+        self.assertIn("batch_heat is an experimental hidden engine", text)
+        self.assertIn("very inaccurate", text)
+
+    def test_engine_batch_heat_is_accepted_by_parser(self):
+        proc = subprocess.run(
+            [sys.executable, "fastcw.py", "--engine", "batch_heat", "--batch-size", "8", "--help"],
             capture_output=True,
             text=True,
             check=False,

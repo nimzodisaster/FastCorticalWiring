@@ -30,6 +30,19 @@ def _dummy_engine_factory(_engine_type, vertices, _faces, _engine_kwargs):
     return _DummyDistanceEngine(vertices)
 
 
+class _BatchRecordingDistanceEngine(_DummyDistanceEngine):
+    supports_batching = True
+
+    def __init__(self, vertices):
+        super().__init__(vertices)
+        self.batch_calls = []
+
+    def compute_distance_batch(self, source_indices):
+        sources = [int(src) for src in source_indices]
+        self.batch_calls.append(sources)
+        return np.column_stack([self.compute_distance(src) for src in sources])
+
+
 class VertexSubsetAnalysisTests(unittest.TestCase):
     def test_normalize_scales_sorts_ascending(self):
         scales = FastCorticalWiringAnalysis.normalize_scales([0.05, 0.001, 0.01, 0.005])
@@ -231,6 +244,52 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
         self.assertIsNotNone(calls[2]["r_lower"])
         self.assertLess(calls[0]["r_lower"], calls[1]["r_lower"])
         self.assertLess(calls[1]["r_lower"], calls[2]["r_lower"])
+
+    def test_compute_all_wiring_costs_consumes_distance_batches_in_order(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        cortex_mask = np.ones(vertices.shape[0], dtype=bool)
+        engine_holder = {}
+
+        def factory(_engine_type, vertices_arg, _faces, _engine_kwargs):
+            engine = _BatchRecordingDistanceEngine(vertices_arg)
+            engine_holder["engine"] = engine
+            return engine
+
+        with mock.patch("core_analysis.create_distance_engine", side_effect=factory):
+            analysis = FastCorticalWiringAnalysis(
+                vertices,
+                faces,
+                cortex_mask,
+                engine_type="potpourri",
+                eps=1e-6,
+                metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
+            )
+
+        analysis._find_radius_for_area = lambda *args, **kwargs: 1.0
+        analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
+        analysis._disk_anisotropy_from_vertices = lambda *args, **kwargs: 0.25
+
+        analysis.compute_all_wiring_costs(
+            compute_msd=True,
+            scale=0.2,
+            area_tol=0.1,
+            batch_size=2,
+            n_samples_between_scales=0,
+        )
+
+        expected_batches = [
+            analysis._bfs_order[i : i + 2] for i in range(0, len(analysis._bfs_order), 2)
+        ]
+        self.assertEqual(engine_holder["engine"].batch_calls, expected_batches)
 
 
 class _StubAnalysis:

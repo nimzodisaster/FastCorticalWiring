@@ -10,3 +10,6 @@ matplotlib
 pycortex
 pygeodesic
 scipy
+robust-laplacian
+# 0.5+ requires SuiteSparse >=7.4 and changed the cholmod API.
+scikit-sparse<0.5

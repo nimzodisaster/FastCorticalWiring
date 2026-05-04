@@ -4,6 +4,7 @@
 import argparse
 import os
 import re
+import sys
 
 import numpy as np
 
@@ -180,6 +181,7 @@ def _run_single_surface(
     overwrite,
     n_samples_between_scales=10,
     boundary_cap_fraction=0.5,
+    batch_size=32,
     compute_anisotropy=False,
     strict_anisotropy=False,
     allow_interior_nonmanifold=False,
@@ -347,6 +349,7 @@ def _run_single_surface(
         vertex_subset=vertex_subset,
         n_samples_between_scales=n_samples_between_scales,
         boundary_cap_fraction=boundary_cap_fraction,
+        batch_size=batch_size,
         compute_anisotropy=compute_anisotropy,
     )
     written = _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, scalar_stem)
@@ -369,6 +372,7 @@ def process_subject(
     overwrite=False,
     n_samples_between_scales=10,
     boundary_cap_fraction=0.5,
+    batch_size=32,
     compute_anisotropy=False,
     strict_anisotropy=False,
     allow_interior_nonmanifold=False,
@@ -426,6 +430,7 @@ def process_subject(
             overwrite=overwrite,
             n_samples_between_scales=n_samples_between_scales,
             boundary_cap_fraction=boundary_cap_fraction,
+            batch_size=batch_size,
             compute_anisotropy=compute_anisotropy,
             strict_anisotropy=strict_anisotropy,
             allow_interior_nonmanifold=allow_interior_nonmanifold,
@@ -473,6 +478,14 @@ def parse_engine_kwargs(values):
 def run_cli(default_engine="potpourri"):
     """Command-line interface for cortical wiring analysis."""
 
+    class _EngineChoiceAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            valid = {"batch_heat", "potpourri", "potpourri_fmm", "pycortex", "pygeodesic"}
+            if values not in valid:
+                visible = "potpourri, potpourri_fmm, pycortex, pygeodesic"
+                parser.error(f"argument {option_string}: invalid choice: {values!r} (choose from {visible})")
+            setattr(namespace, self.dest, values)
+
     parser = argparse.ArgumentParser(
         description="Fast computation of intrinsic cortical wiring costs with pluggable geodesic engines"
     )
@@ -488,7 +501,8 @@ def run_cli(default_engine="potpourri"):
     parser.add_argument("--no-mask", action="store_true", default=False, help="Analyze all vertices without masking")
     parser.add_argument(
         "--engine",
-        choices=["potpourri", "potpourri_fmm", "pycortex", "pygeodesic"],
+        metavar="{potpourri,potpourri_fmm,pycortex,pygeodesic}",
+        action=_EngineChoiceAction,
         default=str(default_engine).lower(),
         help="Geodesic distance engine",
     )
@@ -547,6 +561,12 @@ def run_cli(default_engine="potpourri"):
     )
     parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area binary search")
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Number of source vertices per geodesic distance batch (default: 32; use 1 to disable batching)",
+    )
     parser.add_argument(
         "--n-samples-between-scales",
         type=int,
@@ -640,8 +660,17 @@ def run_cli(default_engine="potpourri"):
 
     args.sample_vertices = None
     args.output_label = _validate_output_label(args.output_label)
+    if int(args.batch_size) <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
 
     engine_kwargs = parse_engine_kwargs(args.engine_kw)
+    if args.engine == "batch_heat":
+        print(
+            "\n"
+            "WARNING: batch_heat is an experimental hidden engine and is not yet operable.\n"
+            "WARNING: validation shows it is very inaccurate at this time; do not use it for analysis.\n",
+            file=sys.stderr,
+        )
     if args.use_robust:
         engine_kwargs["use_robust"] = True
     if args.allow_eigen_fallback:
@@ -677,6 +706,7 @@ def run_cli(default_engine="potpourri"):
             overwrite=args.overwrite,
             n_samples_between_scales=args.n_samples_between_scales,
             boundary_cap_fraction=args.boundary_cap_fraction,
+            batch_size=args.batch_size,
             compute_anisotropy=args.compute_anisotropy,
             strict_anisotropy=args.strict_anisotropy,
             allow_interior_nonmanifold=args.allow_interior_nonmanifold,
@@ -718,6 +748,7 @@ def run_cli(default_engine="potpourri"):
             overwrite=args.overwrite,
             n_samples_between_scales=args.n_samples_between_scales,
             boundary_cap_fraction=args.boundary_cap_fraction,
+            batch_size=args.batch_size,
             compute_anisotropy=args.compute_anisotropy,
             strict_anisotropy=args.strict_anisotropy,
             allow_interior_nonmanifold=args.allow_interior_nonmanifold,
