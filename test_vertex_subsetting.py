@@ -35,6 +35,64 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
         scales = FastCorticalWiringAnalysis.normalize_scales([0.05, 0.001, 0.01, 0.005])
         self.assertEqual(scales, (0.001, 0.005, 0.01, 0.05))
 
+    def test_interior_nonmanifold_auto_enables_potpourri_robust_mode(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, -1.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        faces = np.array(
+            [
+                [0, 1, 2],
+                [0, 2, 3],
+                [0, 3, 1],
+                [1, 3, 2],
+                [0, 1, 4],
+                [0, 4, 5],
+                [0, 5, 1],
+                [1, 5, 4],
+                [0, 1, 6],
+                [0, 6, 7],
+                [0, 7, 1],
+                [1, 7, 6],
+            ],
+            dtype=np.int32,
+        )
+        cortex_mask = np.ones(vertices.shape[0], dtype=bool)
+        engine_calls = []
+
+        def capture_engine(engine_type, vertices_arg, faces_arg, engine_kwargs):
+            engine_calls.append(
+                {
+                    "engine_type": engine_type,
+                    "engine_kwargs": dict(engine_kwargs or {}),
+                }
+            )
+            return _DummyDistanceEngine(vertices_arg)
+
+        with mock.patch("core_analysis.create_distance_engine", side_effect=capture_engine):
+            analysis = FastCorticalWiringAnalysis(
+                vertices,
+                faces,
+                cortex_mask,
+                engine_type="potpourri",
+                engine_kwargs={},
+                eps=1e-6,
+                metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "nonmanifold"},
+            )
+
+        self.assertTrue(analysis.engine_kwargs["use_robust"])
+        self.assertEqual(len(engine_calls), 1)
+        self.assertTrue(engine_calls[0]["engine_kwargs"]["use_robust"])
+
     def test_compute_all_wiring_costs_respects_vertex_subset(self):
         vertices = np.array(
             [
@@ -196,11 +254,13 @@ class _StubAnalysis:
         engine_kwargs=None,
         eps=None,
         metadata=None,
+        allow_interior_nonmanifold=False,
     ):
         self.engine_type = engine_type
         self.engine_kwargs = engine_kwargs
         self.eps = eps
         self.metadata = dict(metadata or {})
+        self.allow_interior_nonmanifold = bool(allow_interior_nonmanifold)
         n = int(cortex_mask.shape[0])
         self.cortex_mask_full = np.asarray(cortex_mask, dtype=bool)
         self.n_vertices_full = n

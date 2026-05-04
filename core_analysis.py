@@ -499,10 +499,21 @@ class FastCorticalWiringAnalysis:
                 f"{n_interior} non-manifold vertices are in the interior — "
                 "geodesic distances may be corrupted."
             )
-            if not self.allow_interior_nonmanifold:
-                raise RuntimeError(
+            if self.engine_type == "potpourri":
+                if self.engine_kwargs.get("use_robust", False):
+                    print("Robust potpourri3d mode is already enabled for this surface.")
+                else:
+                    self.engine_kwargs["use_robust"] = True
+                    print(
+                        "Switching this surface to robust potpourri3d mode "
+                        "(use_robust=True)."
+                    )
+            elif not self.allow_interior_nonmanifold:
+                warnings.warn(
                     "Interior non-manifold vertices detected in cortical submesh. "
-                    "Pass allow_interior_nonmanifold=True to continue anyway."
+                    "Automatic use_robust fallback is only available for the potpourri engine; "
+                    f"continuing with engine_type={self.engine_type!r}.",
+                    RuntimeWarning,
                 )
         
         self.n_vertices = self.vertices.shape[0]
